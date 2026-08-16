@@ -263,6 +263,10 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
     ggml_tensor * inpL;
 
     inpL = build_inp_embd(model.tok_embd);
+    // LOCAL PATCH (tensor-parallel): materialize the embedding input so downstream
+    // views (res-score reshapes) are backend-resident instead of aliasing the pinned
+    // host input buffer, which the meta backend cannot replicate per device.
+    inpL = ggml_cont(ctx0, inpL);
     cb(inpL, "inp_embd", -1);
 
     // K3 MLA is nope-only, so there is no position input
@@ -481,9 +485,13 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
     cb(output, "kda_scan_out", il);
     ggml_tensor * new_state = attn_out.second;
 
+    // LOCAL PATCH (tensor-parallel): use a shape-preserving 2-D view for the state
+    // write-back — a flat 1-D view spanning slots maps ambiguously onto the per-head
+    // split of the state cache and scrambles head slices across devices.
     ggml_build_forward_expand(gf,
         ggml_cpy(ctx0, new_state,
-            ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
+            ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs,
+                         hparams.n_embd_s() * ggml_element_size(ssm_states_all),
                          kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
 
     // K3: single full-rank gate (kimi-linear factors this as g_b(g_a(x)))

@@ -1044,7 +1044,8 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
-        case LLM_ARCH_GLM_DSA:
+        // LOCAL PATCH GLM-DSA-TP: GLM_DSA enabled for -sm tensor (bisection instrument for
+        // the K3 TP corruption; shares the KIMI_K3 MLA split policy in llama-model.cpp).
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:
         case LLM_ARCH_NEMOTRON_H:
@@ -1056,7 +1057,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_KIMI_LINEAR:
-        case LLM_ARCH_KIMI_K3:
+        // LOCAL PATCH: KIMI_K3 enabled for -sm tensor via MLA-aware split policy in llama-model.cpp
         case LLM_ARCH_QWEN3TTS:
             return false;
         default:

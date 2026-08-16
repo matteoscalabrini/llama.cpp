@@ -355,7 +355,20 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    // LOCAL PATCH: normalize mangled static-tensor names like
+    // "Meta(CUDA0,...)#blk.0.ssm_a (reshaped)#0" to their canonical form so the
+    // name-based split policy (and its ref-tensor lookups) can match them.
+    std::string tensor_name = tensor->name;
+    if (tensor_name.rfind("Meta(", 0) == 0) {
+        const size_t hash = tensor_name.find('#');
+        if (hash != std::string::npos) {
+            tensor_name = tensor_name.substr(hash + 1);
+        }
+        const size_t resh = tensor_name.find(" (reshaped)");
+        if (resh != std::string::npos) {
+            tensor_name = tensor_name.substr(0, resh);
+        }
+    }
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -444,6 +457,123 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // LOCAL PATCH: KIMI_K3 MLA-aware tensor-parallel policy.
+        // MLA layers: split per-head expansions (q_b AXIS_1, k_b/v_b AXIS_2); MIRROR the
+        // compressed-latent path (q_a, kv_a_mqa, norms — fall through to default) and the
+        // latent KV cache (no head dimension to shard). attn_gate/attn_output/dense-ffn
+        // fall through to generic rules. Linear-attention (recurrent) layers stay fully
+        // MIRRORED in v1 for correctness (KDA op split support unverified). Routed experts
+        // never reach this callback (-ot exps=CPU keeps them on host).
+        // LOCAL PATCH GLM-DSA-TP: GLM_DSA shares this branch — identical MLA tensor names
+        // (attn_q_b/attn_k_b/attn_v_b, latent kv cache), no recurrent layers (KDA branch
+        // inert), DSA indexer mirrored explicitly below.
+        if (ud->model->arch == LLM_ARCH_KIMI_K3 || ud->model->arch == LLM_ARCH_GLM_DSA) {
+            static const std::regex k3_mla_split_a1 ("blk\\.\\d*\\.attn_q_b\\.weight");
+            static const std::regex k3_mla_split_a2 ("blk\\.\\d*\\.attn_(k|v)_b\\.weight");
+            // linear-attention (KDA/gated-delta) layers: split per head like qwen3next,
+            // the graph lowers to GGML_OP_GATED_DELTA_NET which the meta backend splits.
+            static const std::regex k3_recr_a2      ("blk\\.\\d*\\.ssm_conv1d_(q|k|v)\\.weight");
+            static const std::regex k3_recr_a1      ("blk\\.\\d*\\.ssm_(beta|f_b|g)\\.weight");
+            static const std::regex k3_recr_a0      ("blk\\.\\d*\\.(ssm_dt\\.bias|ssm_a)");
+            static const std::regex k3_recr_mirror  ("blk\\.\\d*\\.(ssm_f_a\\.weight|ssm_norm\\.weight)");
+            static const std::regex k3_recr_cache   ("cache_(r|s)_l\\d*");
+            static const std::regex k3_cache_kv     ("cache_(k|v)_l\\d*");
+            static const std::regex k3_shexp_up_gate("blk\\.\\d*\\.ffn_(up|gate)_shexp\\.weight");
+            static const std::regex k3_shexp_down   ("blk\\.\\d*\\.ffn_down_shexp\\.weight");
+
+            // some static tensors are pre-reshaped at load and carry mangled names like
+            // "Meta(...)#blk.0.ssm_a (reshaped)#0" — normalize before matching
+            std::string k3_name = tensor_name;
+            {
+                const size_t bp = k3_name.find("blk.");
+                if (bp != std::string::npos && bp > 0) {
+                    k3_name = k3_name.substr(bp);
+                }
+                const size_t sp = k3_name.find(" (reshaped)");
+                if (sp != std::string::npos) {
+                    k3_name = k3_name.substr(0, sp);
+                }
+            }
+
+            uint32_t il_k3 = 0;
+            if (k3_name.rfind("blk.", 0) == 0) {
+                il_k3 = std::stoul(k3_name.substr(4));
+            } else if (k3_name.rfind("cache_", 0) == 0) {
+                const size_t lp = k3_name.find("_l", 6);
+                if (lp != std::string::npos) {
+                    il_k3 = std::stoul(k3_name.substr(lp + 2));
+                }
+            }
+            const bool recr_k3 = hparams.is_recr(il_k3);
+
+            // LOCAL PATCH GLM-DSA-TP: mirror the DSA indexer wholesale — small tensors that
+            // compute top-k token selection; replication keeps selections identical per device.
+            static const std::regex glm_indexer("blk\\.\\d*\\.indexer\\..*");
+            if (std::regex_match(k3_name, glm_indexer)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+
+            // LOCAL PATCH GLM-DSA-TP bisect switches: GLM_TP_MIRROR=attn,shexp forces the
+            // named groups to MIRRORED so the corruption source can be isolated per-group
+            // without rebuilds. attn mirrors q_b/k_b/v_b AND attn_output (consistency).
+            static const std::string mirror_env = getenv("GLM_TP_MIRROR") ? getenv("GLM_TP_MIRROR") : "";
+            const bool mirror_attn  = mirror_env.find("attn")  != std::string::npos;
+            const bool mirror_shexp = mirror_env.find("shexp") != std::string::npos;
+            static const std::regex bisect_attn ("blk\\.\\d*\\.attn_(q_b|k_b|v_b|output)\\.weight");
+            static const std::regex bisect_shexp("blk\\.\\d*\\.ffn_(up|gate|down)_shexp\\.weight");
+            if (mirror_attn && std::regex_match(k3_name, bisect_attn)) {
+                fprintf(stderr, "K3-split-dbg: BISECT mirror attn %s\n", k3_name.c_str());
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (mirror_shexp && std::regex_match(k3_name, bisect_shexp)) {
+                fprintf(stderr, "K3-split-dbg: BISECT mirror shexp %s\n", k3_name.c_str());
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+
+            if (il_k3 < 1) {
+                fprintf(stderr, "K3-split-dbg: %s (il=%u recr=%d)\n", k3_name.c_str(), il_k3, (int)recr_k3);
+                fflush(stderr);
+            }
+
+            if (recr_k3) {
+                if (std::regex_match(k3_name, k3_recr_mirror)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
+                if (std::regex_match(k3_name, k3_recr_a2)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+                }
+                if (std::regex_match(k3_name, k3_recr_a1)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+                }
+                if (std::regex_match(k3_name, k3_recr_a0)) {
+                    // ssm_a may arrive pre-reshaped to [1, n_head]; heads then live on axis 1
+                    if (tensor->ne[0] == 1 && tensor->ne[1] > 1) {
+                        return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+                    }
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+                }
+                if (std::regex_match(k3_name, k3_recr_cache)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+                }
+                // attn_q/k/v/gate + attn_output fall through to generic per-head rules
+            }
+            if (std::regex_match(k3_name, k3_cache_kv)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            if (std::regex_match(k3_name, k3_mla_split_a1)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
+            }
+            if (std::regex_match(k3_name, k3_mla_split_a2)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+            }
+            if (std::regex_match(k3_name, k3_shexp_up_gate)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+            }
+            if (std::regex_match(k3_name, k3_shexp_down)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -525,6 +655,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        // LOCAL PATCH: KIMI_K3 conv-state cache holds three sections (q|k|v conv states);
+        // each section must be split across devices individually (same shape as qwen's
+        // r-cache segmenting, but three homogeneous sections).
+        if (ud->model->arch == LLM_ARCH_KIMI_K3) {
+            static const std::regex k3_r_cache("cache_r_l\\d*");
+            if (std::regex_match(tensor_name, k3_r_cache)) {
+                GGML_ASSERT(tensor->ne[axis] % 3 == 0);
+                return {{tensor->ne[axis]/3, 3}};
+            }
+            return {{tensor->ne[axis], 1}};
+        }
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
             const int64_t head_k_dim = hparams.ssm_d_state;
             const int64_t head_v_dim = hparams.ssm_d_state;
@@ -595,6 +736,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+        // LOCAL PATCH: KIMI_K3 — generic granularity paths divide by hparams fields K3
+        // does not populate (ssm_d_state, n_gqa) -> SIGFPE. All K3 split dims divide
+        // evenly by the device count at head boundaries (96 heads, dims 12288/18432/6144),
+        // so granularity 1 is exact under the default even tensor split.
+        // LOCAL PATCH GLM-DSA-TP: same exactness argument for GLM_DSA — 64 heads/4 devs
+        // = 16/dev; attn_q_b out 16384/4 = 4096 = 16*256 head-aligned; indexer mirrored.
+        if (ud->model->arch == LLM_ARCH_KIMI_K3 || ud->model->arch == LLM_ARCH_GLM_DSA) {
+            return std::vector<int64_t>(segments.size(), 1);
+        }
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention

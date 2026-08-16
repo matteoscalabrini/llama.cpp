@@ -1,3 +1,4 @@
+#include <cstring>
 #include "debug.h"
 
 #include "common.h"
@@ -174,6 +175,14 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     const bool is_host = ggml_backend_buffer_is_host(t->buffer);
+
+    // LOCAL PATCH GLM-DSA-TP: meta split buffers cannot materialize non-contiguous
+    // split views for host reads (asserts in ggml-backend-meta.cpp) — skip, keep walking.
+    if (!is_host && !ggml_is_contiguous(t) &&
+            strstr(ggml_backend_buffer_name(t->buffer), "Meta") != nullptr) {
+        LOG("%s:   [skipped non-contiguous meta view] sum = skipped\n", __func__);
+        return true;
+    }
 
     if (!is_host) {
         auto n_bytes = ggml_nbytes(t);
