@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-cpu-impl.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -169,6 +170,9 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+
+    // no-op unless GGML_NUMA_MIRROR is set; first call builds the replicas
+    ggml_numa_mirror_scan_graph(cgraph);
 
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
