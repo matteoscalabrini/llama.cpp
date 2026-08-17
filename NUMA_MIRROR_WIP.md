@@ -98,7 +98,87 @@ interleave). Correctness gate: **BIT-EXACT PASS**, 320/320 top-20 logprobs ident
 
 ### Full model (GLM-5.2 UD-Q3_K_XL, 302 GB, hybrid, prod flags)
 
-<!-- FULL_MODEL_RESULTS -->
+Prod flags verbatim, same binary, decode measured before prefill, first two decode runs
+discarded as warmup, decode figure = mean of runs 3-5.
+
+**Unpinned regime (`GGML_CUDA_NO_PINNED=1`, what prod runs today) — 3 arms, one session:**
+
+| arm | decode tg | prefill pp | resident (node0/node1) |
+|---|---|---|---|
+| `--interleave=all`, no mirror — **today's prod shape** | 7.20 | 85.4 | 146.9 / 146.9 |
+| `--membind=0`, no mirror | 6.12 | 95.5 | 293.7 / 0.0 |
+| **`--membind=0` + mirror** | **9.06** | **108.4** | 293.7 / 292.8 |
+
+**+25.8% decode and +26.9% prefill against today's prod shape.** MTP draft acceptance was
+0.92308 in every arm — byte-identical accepted/generated counts, i.e. the model is behaving
+identically, not merely similarly.
+
+The middle arm is the attribution control and it matters:
+
+- `--membind=0` *alone* **costs 15% of decode** (7.20 → 6.12). That is arm D from the premise
+  table at full scale: all weights on one node means half the threads read across xGMI.
+- So the decode win belongs to the mirror, not the placement flag: **6.12 → 9.06 = +48% at
+  identical placement.**
+- Prefill splits the other way: `--membind=0` alone is worth +12% (85.4 → 95.5) because all four
+  GPUs hang off socket 0, so op-offload H2D staging becomes socket-local. The mirror then adds a
+  further +13.5% (95.5 → 108.4) — most plausibly because moving the CPU threads' expert reads onto
+  node 1 stops them contending with the GPU's DMA stream on node 0's memory controller.
+
+Cost: 586.6 GB resident instead of 293.8 GB, and ~20 s of extra load time for the replica memcpy
+(load-to-ready 403 s vs 383 s).
+
+**Pinned regime (no `GGML_CUDA_NO_PINNED`, where prod is heading) — 3 more arms, same session:**
+
+| arm | decode tg | prefill pp | resident (node0/node1) |
+|---|---|---|---|
+| `--interleave=all`, no mirror | 7.44 | 148.3 | 153.0 / 153.0 |
+| `--interleave=all` + mirror — **silently no-ops, see below** | 7.28 | 147.6 | 153.1 / 153.0 |
+| **`--membind=0` + mirror** | **9.02** (runs 3-5: 9.35 / 9.61 / 8.10) | 146.8 | 306.0 / 292.9 |
+
+Pinned decode gain **+21%** on the mean, +26% on the median; prefill flat (−1%), because pinning
+has already solved prefill and there is nothing left for socket-locality to win there.
+
+**So the mirror is worth ~+21-26% decode in both regimes.** The regimes differ only in what
+happens to prefill: unpinned it gains +27%, pinned it is neutral.
+
+Best measured configuration overall — **pinned + `--membind=0` + mirror: 9.02-9.35 tg / 146.8 pp**,
+against today's production shape (unpinned + interleave) at 7.20 tg / 85.4 pp: **+25-30% decode
+and +72% prefill.** That combines this work with the other thread's pinning finding; neither
+alone gets there.
+
+### `--interleave=all` makes the mirror silently do nothing — use `--membind=0`
+
+The pinned+interleave+mirror arm built **no replica at all** (306.1 GB resident, a plain 153/153
+split) and duly performed like the baseline. Two independent causes, both worth knowing:
+
+1. `ggml_numa_mirror_alloc_replica` refuses a node with less than `size + 2 GB` in
+   `/sys/devices/system/node/nodeN/meminfo` `MemFree`. Under interleave node 1 already holds half
+   the model plus page cache, so the check fails even though the kernel would happily reclaim
+   cache. **MemFree ignores reclaimable memory — the check is too conservative.**
+2. Pinned (`cudaMallocHost`) pages cannot be migrated, so `mbind(MPOL_MF_MOVE)` on the primary
+   cannot repair an interleaved layout after the fact. It also is not free: that arm's
+   load-to-ready was 742 s vs 528 s, ~3.5 minutes spent walking 302 GB of VMAs to accomplish
+   nothing.
+
+Both disappear with `--membind=0`, which places the primary correctly at allocation time instead
+of trying to move it afterwards. **`--membind=0` is required, not a preference.**
+
+The failure is silent because `GGML_LOG_INFO` from a dynamically loaded backend does not reach
+llama-server's log at default verbosity — none of the "NUMA mirror:" lines appear anywhere.
+**Verify engagement with `numastat -p $(pgrep -x llama-server)` instead: mirrored means total
+resident ≈ 2× the model with a full copy on each node.** Fixing this properly (log to stderr
+directly, and count reclaimable memory in the free check) is open item 0 below; the binary that
+produced every number above was deliberately left unrebuilt so the results stay reproducible.
+
+## Recommended production change (measured, not promoted — prod config left untouched)
+
+GLM-5.2 entry in `/etc/llama-swap/config-ik.yaml`: replace `numactl --interleave=all` with
+`numactl --membind=0`, add `GGML_NUMA_MIRROR=1`, and drop `GGML_CUDA_NO_PINNED=1` (the other
+thread's finding). Expected 7.20 → ~9.0-9.4 tg and 85 → ~147 pp. Costs ~590 GB RAM instead of
+~300 GB, and ~9 minutes to load instead of ~6.5.
+
+Not promoted here because the pinning half belongs to another session's thread and prod entries
+are a shared surface; the two changes should land together, with a date-suffixed backup.
 
 ## Interaction with the pinned-memory promotion (READ THIS BEFORE PROMOTING EITHER)
 
@@ -118,9 +198,15 @@ So the combined prod recipe is `--membind=0` + pinning + `GGML_NUMA_MIRROR=1`, n
 
 ## Open items
 
-1. Measure `--membind=0` + pinned + mirror (the intended prod combination).
+0. **Make engagement observable and the free check honest.** Log to stderr directly rather than
+   through `GGML_LOG_INFO` (nothing currently reaches llama-server's log), and count reclaimable
+   memory instead of bare `MemFree` in `ggml_numa_mirror_alloc_replica`. Also consider skipping
+   the `MPOL_MF_MOVE` attempt when the primary is unmigratable — it cost 3.5 minutes of load time
+   for nothing in the interleave arm.
+1. ~~Measure `--membind=0` + pinned + mirror~~ — done, see the pinned table above.
 2. `-t 32 -tb 64` with `-Cr/--cpu-range`: prefill wants 64 threads, decode wants fewer. Untested
-   and orthogonal to the mirror.
+   and orthogonal to the mirror. The premise table shows the split clearly (t32 local wins decode
+   by 36% and loses prefill by 33%), so a per-phase thread count should compose with the mirror.
 3. Buffer table is fixed at 16 entries and replicas are never freed before process exit —
    fine for one-model-per-process, wrong for a long-lived multi-model host.
 4. If a 5th GPU lands on socket 1, the op-offload upload source should become that socket's
