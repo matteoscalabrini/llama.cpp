@@ -957,6 +957,25 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    // LOCAL PATCH (rr-offload): spread offloaded ops across all capable backends
+                    // instead of always picking the first. Deterministic per weight name so that
+                    // graph re-splits are stable. Default OFF -> byte-identical to upstream.
+                    static const bool rr_offload = getenv("GGML_SCHED_OFFLOAD_RR") != NULL;
+                    if (rr_offload) {
+                        int cand[GGML_SCHED_MAX_BACKENDS];
+                        int n_cand = 0;
+                        for (int b = 0; b < src_backend_id; b++) {
+                            if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                                cand[n_cand++] = b;
+                            }
+                        }
+                        if (n_cand > 0) {
+                            unsigned int h = 2166136261u;
+                            for (const char * c = src->name; *c; c++) { h ^= (unsigned char)*c; h *= 16777619u; }
+                            SET_CAUSE(tensor, "1.off");
+                            return cand[h % (unsigned int)n_cand];
+                        }
+                    }
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");
@@ -1628,7 +1647,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
-                if (split->graph.n_nodes > 0 &&
+                // LOCAL PATCH (no-expert-ids): the selective-expert copy needs a host readback of
+                // the router ids, which forces a full device drain every layer. At large ub nearly
+                // all experts are used, so it saves ~no bytes. Default OFF -> upstream behaviour.
+                static const bool no_expert_ids = getenv("GGML_SCHED_NO_EXPERT_IDS") != NULL;
+                if (!no_expert_ids &&
+                    split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (
                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
