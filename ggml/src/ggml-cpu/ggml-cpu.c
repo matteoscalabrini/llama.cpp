@@ -1099,6 +1099,26 @@ void ggml_numa_mirror_scan_graph(const struct ggml_cgraph * cgraph) {
                 GGML_NUMA_MIRROR_LOG("WARNING: below 50%% coverage the mirror is likely a NET LOSS "
                         "(membind cost with too few replicas to repay it)\n");
             }
+            // Also drop the summary at a predictable path. Process managers commonly
+            // swallow a child's stderr (llama-swap captures it into compressed blobs
+            // that reach neither the journal nor its own /logs), and a mirror that
+            // silently fails to engage costs an entire A/B before anyone notices.
+            //   cat /tmp/ggml-numa-mirror.$(pgrep -x llama-server)
+            const char * dir = getenv("GGML_NUMA_MIRROR_STATUS_DIR");
+            if (dir == NULL) { dir = "/tmp"; }
+            if (dir[0] != '\0' && strcmp(dir, "off") != 0) {
+                char path[512];
+                if (snprintf(path, sizeof(path), "%s/ggml-numa-mirror.%d", dir, (int) getpid()) < (int) sizeof(path)) {
+                    FILE * sf = fopen(path, "w");
+                    if (sf != NULL) {
+                        fprintf(sf, "coverage_pct %.1f\nmirrored_bytes %zu\nnot_mirrored_bytes %zu\n"
+                                    "gemm_weight_bytes_in_graph %zu\nnodes %d\nhome_node %d\nbuffers %d\n",
+                                pct, mirrored, skipped, seen, g_numa_mirror.n_nodes,
+                                g_numa_mirror.home_node, atomic_load_explicit(&g_numa_mirror.n_bufs, memory_order_acquire));
+                        fclose(sf);
+                    }
+                }
+            }
             g_numa_mirror.reported = 1;
         }
     }
