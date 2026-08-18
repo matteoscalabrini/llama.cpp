@@ -764,7 +764,18 @@ static struct {
     int     home_node;
     size_t  min_bytes;
     int     enabled; // -1 = not yet parsed
-} g_numa_mirror = { 0, {{0}}, 0, 0, 0, -1 };
+    // coverage accounting: bytes of GEMM weights seen vs actually served node-locally.
+    // Reported once, because a mirror that covers 0% of the experts is a net LOSS
+    // (the membind penalty with no replicas to repay it) and must not be silent.
+    size_t  bytes_seen;
+    size_t  bytes_mirrored;
+    size_t  bytes_skipped;
+    int     reported;
+} g_numa_mirror = { 0, {{0}}, 0, 0, 0, -1, 0, 0, 0, 0 };
+
+// stderr directly: GGML_LOG_* from a dynamically loaded backend does not reach
+// llama-server's log at default verbosity, which made a non-engaging mirror silent.
+#define GGML_NUMA_MIRROR_LOG(...) do { fprintf(stderr, "NUMA mirror: " __VA_ARGS__); fflush(stderr); } while (0)
 
 static int ggml_numa_mirror_count_nodes(void) {
     if (g_state.numa.n_nodes > 0) {
@@ -812,6 +823,9 @@ static bool ggml_numa_mirror_bind_pages(void * addr, size_t size, int node, bool
     return rv == 0;
 }
 
+// Free memory INCLUDING reclaimable page cache. Bare MemFree caused a silent
+// refusal to replicate on a node that merely held file cache the kernel would
+// have evicted on demand.
 static long long ggml_numa_mirror_node_free_bytes(int node) {
     char path[256];
     int rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", node);
@@ -821,14 +835,52 @@ static long long ggml_numa_mirror_node_free_bytes(int node) {
         return -1;
     }
     char line[256];
-    long long kb = -1;
+    long long free_kb = -1, inactive_file_kb = 0;
     while (fgets(line, sizeof(line), f)) {
-        if (sscanf(line, "Node %*d MemFree: %lld kB", &kb) == 1) {
-            break;
+        long long v;
+        if (sscanf(line, "Node %*d MemFree: %lld kB", &v) == 1) {
+            free_kb = v;
+        } else if (sscanf(line, "Node %*d Inactive(file): %lld kB", &v) == 1) {
+            inactive_file_kb = v;
         }
     }
     fclose(f);
-    return kb < 0 ? -1 : kb * 1024;
+    return free_kb < 0 ? -1 : (free_kb + inactive_file_kb) * 1024;
+}
+
+// Sample where a range's pages actually live, so we never pay for a migration
+// that cannot work. Pinned (cudaMallocHost) pages are unmovable: attempting
+// MPOL_MF_MOVE across a 302 GB buffer cost 3.5 minutes of load time and moved
+// nothing. Returns the fraction (0..1) of sampled pages already on `node`.
+static double ggml_numa_mirror_local_fraction(void * addr, size_t size, int node) {
+    enum { N_SAMPLES = 512 };
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    if (size < page) {
+        return 1.0;
+    }
+    void * pages[N_SAMPLES];
+    int    status[N_SAMPLES];
+    const size_t n_pages = size / page;
+    const size_t stride  = n_pages > N_SAMPLES ? n_pages / N_SAMPLES : 1;
+    int n = 0;
+    for (size_t i = 0; i < n_pages && n < N_SAMPLES; i += stride) {
+        pages[n++] = (char *) addr + i * page;
+    }
+    for (int i = 0; i < n; ++i) {
+        status[i] = -1;
+    }
+    // move_pages with no target nodes = query current placement
+    if (syscall(__NR_move_pages, 0, (unsigned long) n, pages, NULL, status, 0) != 0) {
+        return -1.0;
+    }
+    int local = 0, valid = 0;
+    for (int i = 0; i < n; ++i) {
+        if (status[i] >= 0) {
+            ++valid;
+            if (status[i] == node) { ++local; }
+        }
+    }
+    return valid == 0 ? -1.0 : (double) local / (double) valid;
 }
 
 bool ggml_numa_mirror_enabled(void) {
@@ -838,7 +890,7 @@ bool ggml_numa_mirror_enabled(void) {
         if (on) {
             g_numa_mirror.n_nodes = ggml_numa_mirror_count_nodes();
             if (g_numa_mirror.n_nodes < 2) {
-                GGML_LOG_WARN("NUMA mirror: requested but only %d node(s) present - disabled\n", g_numa_mirror.n_nodes);
+                GGML_NUMA_MIRROR_LOG("requested but only %d node(s) present - disabled\n", g_numa_mirror.n_nodes);
                 on = false;
             }
         }
@@ -847,7 +899,7 @@ bool ggml_numa_mirror_enabled(void) {
         g_numa_mirror.home_node = 0;
         g_numa_mirror.enabled = on ? 1 : 0;
         if (on) {
-            GGML_LOG_INFO("NUMA mirror: enabled, %d nodes, home node %d, min buffer %zu MiB\n",
+            GGML_NUMA_MIRROR_LOG("enabled, %d nodes, home node %d, min buffer %zu MiB\n",
                     g_numa_mirror.n_nodes, g_numa_mirror.home_node, g_numa_mirror.min_bytes >> 20);
         }
     }
@@ -857,17 +909,17 @@ bool ggml_numa_mirror_enabled(void) {
 static void * ggml_numa_mirror_alloc_replica(size_t size, int node) {
     long long free_bytes = ggml_numa_mirror_node_free_bytes(node);
     if (free_bytes >= 0 && (unsigned long long) free_bytes < size + (2ull << 30)) {
-        GGML_LOG_WARN("NUMA mirror: node %d has only %.1f GiB free, need %.1f GiB - skipping replica\n",
+        GGML_NUMA_MIRROR_LOG("node %d has only %.1f GiB free (incl. reclaimable), need %.1f GiB - skipping replica\n",
                 node, free_bytes / (1024.0*1024.0*1024.0), (size + (2ull << 30)) / (1024.0*1024.0*1024.0));
         return NULL;
     }
     void * mem = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) {
-        GGML_LOG_WARN("NUMA mirror: mmap of %zu bytes for node %d replica failed\n", size, node);
+        GGML_NUMA_MIRROR_LOG("mmap of %zu bytes for node %d replica failed\n", size, node);
         return NULL;
     }
     if (!ggml_numa_mirror_bind_pages(mem, size, node, false)) {
-        GGML_LOG_WARN("NUMA mirror: mbind to node %d failed\n", node);
+        GGML_NUMA_MIRROR_LOG("mbind to node %d failed\n", node);
         munmap(mem, size);
         return NULL;
     }
@@ -899,7 +951,7 @@ void ggml_numa_mirror_register(struct ggml_backend_buffer * buffer, void * base,
                 return; // already mirrored
             }
             // address range reused by a different buffer: drop stale replicas, rebuild
-            GGML_LOG_WARN("NUMA mirror: buffer address %p reused by a new buffer - rebuilding replicas\n", base);
+            GGML_NUMA_MIRROR_LOG("buffer address %p reused by a new buffer - rebuilding replicas\n", base);
             for (int nd = 0; nd < GGML_NUMA_MAX_NODES; ++nd) {
                 if (nd != g_numa_mirror.home_node && g_numa_mirror.bufs[i].replica[nd] != NULL) {
                     munmap(g_numa_mirror.bufs[i].replica[nd], g_numa_mirror.bufs[i].size);
@@ -912,13 +964,14 @@ void ggml_numa_mirror_register(struct ggml_backend_buffer * buffer, void * base,
     }
     if (slot < 0) {
         if (n >= GGML_NUMA_MIRROR_MAX_BUFS) {
-            GGML_LOG_WARN("NUMA mirror: buffer table full, %p (%zu bytes) not mirrored\n", base, size);
+            GGML_NUMA_MIRROR_LOG("buffer table full, %p (%zu bytes) not mirrored\n", base, size);
             return;
         }
         slot = n;
     }
 
     const int home = g_numa_mirror.home_node;
+    const double gib = size / (1024.0*1024.0*1024.0);
     struct ggml_numa_mirror_buf * mb = &g_numa_mirror.bufs[slot];
     memset(mb, 0, sizeof(*mb));
     mb->owner = buffer;
@@ -926,11 +979,29 @@ void ggml_numa_mirror_register(struct ggml_backend_buffer * buffer, void * base,
     mb->size  = size;
     mb->replica[home] = base;
 
-    int64_t t0 = ggml_time_us();
-    bool moved = ggml_numa_mirror_bind_pages(base, size, home, true);
     int64_t t1 = ggml_time_us();
-    GGML_LOG_INFO("NUMA mirror: primary %p (%.1f GiB) bound to node %d (%s, %.2f s)\n",
-            base, size / (1024.0*1024.0*1024.0), home, moved ? "ok" : "mbind FAILED", (t1 - t0) / 1e6);
+    const double local_before = ggml_numa_mirror_local_fraction(base, size, home);
+    if (local_before >= 0.95) {
+        ggml_numa_mirror_bind_pages(base, size, home, false); // policy only, nothing to move
+    } else {
+        // probe on a small prefix before committing to walking the whole buffer
+        const size_t probe = MIN(size, 1ull << 30);
+        ggml_numa_mirror_bind_pages(base, probe, home, true);
+        const double probe_local = ggml_numa_mirror_local_fraction(base, probe, home);
+        if (probe_local >= 0.95) {
+            ggml_numa_mirror_bind_pages(base, size, home, true);
+        } else {
+            GGML_NUMA_MIRROR_LOG(
+                "primary %.1f GiB is only %.0f%% on node %d and its pages will not migrate "
+                "(pinned host memory cannot be moved). Node-%d threads keep reading it remotely. "
+                "Launch with `numactl --membind=%d` to place it correctly at allocation time.\n",
+                gib, local_before * 100.0, home, home, home);
+        }
+    }
+    const double local_after = ggml_numa_mirror_local_fraction(base, size, home);
+    int64_t t2 = ggml_time_us();
+    GGML_NUMA_MIRROR_LOG("primary %p %.1f GiB: %.0f%% -> %.0f%% on node %d (%.1f s)\n",
+            base, gib, local_before * 100.0, local_after * 100.0, home, (t2 - t1) / 1e6);
 
     int n_replicas = 0;
     for (int node = 0; node < g_numa_mirror.n_nodes && node < GGML_NUMA_MAX_NODES; ++node) {
@@ -939,16 +1010,21 @@ void ggml_numa_mirror_register(struct ggml_backend_buffer * buffer, void * base,
         }
         void * rep = ggml_numa_mirror_alloc_replica(size, node);
         if (rep == NULL) {
-            GGML_LOG_WARN("NUMA mirror: node %d threads will read from node %d\n", node, home);
+            GGML_NUMA_MIRROR_LOG("node %d has no replica - its threads read node %d remotely\n", node, home);
             continue;
         }
         ggml_numa_mirror_copy(rep, base, size);
         mb->replica[node] = rep;
         ++n_replicas;
     }
-    int64_t t2 = ggml_time_us();
-    GGML_LOG_INFO("NUMA mirror: %d replica(s) of %.1f GiB built in %.2f s\n",
-            n_replicas, size / (1024.0*1024.0*1024.0), (t2 - t1) / 1e6);
+    int64_t t3 = ggml_time_us();
+    GGML_NUMA_MIRROR_LOG("%d replica(s) of %.1f GiB built in %.1f s\n", n_replicas, gib, (t3 - t2) / 1e6);
+
+    if (n_replicas > 0) {
+        g_numa_mirror.bytes_mirrored += size;
+    } else {
+        g_numa_mirror.bytes_skipped += size;
+    }
 
     if (slot == n) {
         atomic_store_explicit(&g_numa_mirror.n_bufs, n + 1, memory_order_release);
@@ -982,12 +1058,49 @@ void ggml_numa_mirror_scan_graph(const struct ggml_cgraph * cgraph) {
             continue;
         }
         const struct ggml_tensor * src0 = node->src[0];
-        if (src0 == NULL || src0->buffer == NULL || !ggml_backend_buft_is_host(src0->buffer->buft)) {
+        if (src0 == NULL || src0->buffer == NULL) {
+            continue;
+        }
+        // ggml_backend_buft_is_host() is FALSE for the repack/AMX extra buffer types
+        // (they set is_host = nullptr) even though their memory is plain host memory
+        // allocated from the CPU buffer type. Excluding them handed every repacked
+        // expert tensor to a path the mirror could not serve, making coverage a
+        // property of the model's quant instead of the mirror.
+        if (!ggml_backend_cpu_buft_is_mirrorable(src0->buffer->buft)) {
             continue;
         }
         ggml_numa_mirror_register(src0->buffer,
                 ggml_backend_buffer_get_base(src0->buffer),
                 ggml_backend_buffer_get_size(src0->buffer));
+    }
+
+    // one-shot coverage report: what fraction of CPU GEMM weight bytes is actually
+    // served node-locally. Below ~50% the membind cost outweighs the replicas.
+    if (!g_numa_mirror.reported) {
+        size_t seen = 0;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const struct ggml_tensor * node = cgraph->nodes[i];
+            if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            const struct ggml_tensor * src0 = node->src[0];
+            if (src0 != NULL && src0->buffer != NULL && ggml_backend_buffer_is_host(src0->buffer)) {
+                seen += ggml_nbytes(src0);
+            }
+        }
+        g_numa_mirror.bytes_seen = seen;
+        const size_t mirrored = g_numa_mirror.bytes_mirrored;
+        const size_t skipped  = g_numa_mirror.bytes_skipped;
+        if (mirrored + skipped > 0) {
+            const double pct = 100.0 * mirrored / (double)(mirrored + skipped);
+            GGML_NUMA_MIRROR_LOG("coverage: %.1f GiB mirrored, %.1f GiB not (%.0f%% of registered weight buffers)\n",
+                    mirrored / (1024.0*1024.0*1024.0), skipped / (1024.0*1024.0*1024.0), pct);
+            if (pct < 50.0) {
+                GGML_NUMA_MIRROR_LOG("WARNING: below 50%% coverage the mirror is likely a NET LOSS "
+                        "(membind cost with too few replicas to repay it)\n");
+            }
+            g_numa_mirror.reported = 1;
+        }
     }
 }
 

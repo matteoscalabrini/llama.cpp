@@ -86,6 +86,12 @@ static ggml_backend_buffer_type_t * ggml_backend_cpu_device_get_extra_buffers_ty
     GGML_UNUSED(device);
 }
 
+// True for any buffer type whose memory the CPU GEMM paths read directly, so the
+// NUMA mirror can replicate it. Extra buffer types (repack, AMX) allocate from the
+// CPU buffer type but report is_host = nullptr, so ggml_backend_buft_is_host() alone
+// silently excluded every repacked weight from mirroring.
+extern "C" bool ggml_backend_cpu_buft_is_mirrorable(ggml_backend_buffer_type_t buft);
+
 static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buft) {
     for (auto * extra : ggml_backend_cpu_get_extra_buffer_types()) {
         if (extra == buft) {
@@ -93,6 +99,10 @@ static bool ggml_backend_cpu_is_extra_buffer_type(ggml_backend_buffer_type_t buf
         }
     }
     return false;
+}
+
+extern "C" bool ggml_backend_cpu_buft_is_mirrorable(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && (ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft));
 }
 
 // CPU backend - backend (stream)

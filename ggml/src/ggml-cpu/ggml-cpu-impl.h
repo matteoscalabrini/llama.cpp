@@ -538,6 +538,9 @@ int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
 // Off by default: ggml_numa_mirror_remap is an immediate return when no buffer
 // is registered, so the vanilla path pays one relaxed atomic load per GEMM op.
 bool         ggml_numa_mirror_enabled(void);
+// implemented in ggml-cpu.cpp: host buffers PLUS the extra buffer types (repack, AMX),
+// whose memory is host memory but which report is_host = nullptr
+bool         ggml_backend_cpu_buft_is_mirrorable(struct ggml_backend_buffer_type * buft);
 void         ggml_numa_mirror_register(struct ggml_backend_buffer * buffer, void * base, size_t size);
 const void * ggml_numa_mirror_remap(const void * p);
 void         ggml_numa_mirror_scan_graph(const struct ggml_cgraph * cgraph);
