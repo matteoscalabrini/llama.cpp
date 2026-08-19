@@ -659,6 +659,10 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+// defined in ggml-cpu.c (C linkage); exported so the scheduler can pick the replica that
+// is local to the destination GPU rather than to the calling thread
+extern "C" const void * ggml_numa_mirror_remap_node(const void * p, int node);
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
@@ -682,6 +686,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
+    }
+    if (strcmp(name, "ggml_numa_mirror_remap_node") == 0) {
+        return (void *)ggml_numa_mirror_remap_node;
     }
 
     // threadpool - TODO:  move to ggml-base

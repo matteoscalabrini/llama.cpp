@@ -5337,10 +5337,16 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 // ---- prefill overlap: dedicated H2D copy stream + ordering events ----------------
 // One copy stream and one event pair per device, created on first use. The events are
 // created with cudaEventDisableTiming: they exist only to order streams.
+#define GGML_CUDA_OVL_MAX_SLOTS 5
 struct ggml_cuda_copy_ctx {
     cudaStream_t stream      = nullptr;
     cudaEvent_t  copy_done   = nullptr;
     cudaEvent_t  compute_done = nullptr;
+    // per staging slot, so an ordering edge names one buffer instead of global progress
+    cudaEvent_t  slot_copy   [GGML_CUDA_OVL_MAX_SLOTS] = { nullptr };
+    cudaEvent_t  slot_compute[GGML_CUDA_OVL_MAX_SLOTS] = { nullptr };
+    bool         slot_copy_rec   [GGML_CUDA_OVL_MAX_SLOTS] = { false };
+    bool         slot_compute_rec[GGML_CUDA_OVL_MAX_SLOTS] = { false };
 };
 
 static ggml_cuda_copy_ctx & ggml_cuda_copy_ctx_get(int device) {
@@ -5351,6 +5357,10 @@ static ggml_cuda_copy_ctx & ggml_cuda_copy_ctx_get(int device) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&c.stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&c.copy_done,    cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(&c.compute_done, cudaEventDisableTiming));
+        for (int s = 0; s < GGML_CUDA_OVL_MAX_SLOTS; s++) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&c.slot_copy[s],    cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&c.slot_compute[s], cudaEventDisableTiming));
+        }
     }
     return c;
 }
@@ -5405,6 +5415,71 @@ extern "C" void ggml_backend_cuda_copy_stream_d2d(
     CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, c.stream));
 }
 
+// ---- per-slot pipeline edges -----------------------------------------------------
+// record: the copy filling slot `slot` has been issued
+extern "C" void ggml_backend_cuda_record_copy_slot(ggml_backend_t backend, int slot) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_copy_ctx & c = ggml_cuda_copy_ctx_get(cuda_ctx->device);
+    if (slot < 0 || slot >= GGML_CUDA_OVL_MAX_SLOTS) { return; }
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaEventRecord(c.slot_copy[slot], c.stream));
+    c.slot_copy_rec[slot] = true;
+}
+
+// compute must not read slot `slot` before the copy that filled it has landed
+extern "C" void ggml_backend_cuda_compute_wait_slot(ggml_backend_t backend, int slot) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_copy_ctx & c = ggml_cuda_copy_ctx_get(cuda_ctx->device);
+    if (slot < 0 || slot >= GGML_CUDA_OVL_MAX_SLOTS || !c.slot_copy_rec[slot]) { return; }
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), c.slot_copy[slot], 0));
+}
+
+// record: the compute reading slot `slot` has been enqueued
+extern "C" void ggml_backend_cuda_record_compute_slot(ggml_backend_t backend, int slot) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_copy_ctx & c = ggml_cuda_copy_ctx_get(cuda_ctx->device);
+    if (slot < 0 || slot >= GGML_CUDA_OVL_MAX_SLOTS) { return; }
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaEventRecord(c.slot_compute[slot], cuda_ctx->stream()));
+    c.slot_compute_rec[slot] = true;
+}
+
+// a copy must not overwrite slot `slot` before its previous consumer has finished
+extern "C" void ggml_backend_cuda_copies_wait_slot(ggml_backend_t backend, int slot) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_copy_ctx & c = ggml_cuda_copy_ctx_get(cuda_ctx->device);
+    if (slot < 0 || slot >= GGML_CUDA_OVL_MAX_SLOTS || !c.slot_compute_rec[slot]) { return; }
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaStreamWaitEvent(c.stream, c.slot_compute[slot], 0));
+}
+
+// The NUMA node this GPU hangs off, from sysfs. Lets op-offload read its weights from the
+// replica local to the destination card rather than always from the home node - on a
+// dual-socket box the wrong choice spends the card's x16 dragging bytes over xGMI.
+extern "C" int ggml_backend_cuda_get_numa_node(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    char bus[64] = {0};
+    if (cudaDeviceGetPCIBusId(bus, (int) sizeof(bus) - 1, cuda_ctx->device) != cudaSuccess) {
+        return -1;
+    }
+    for (char * c = bus; *c; ++c) {
+        if (*c >= 'A' && *c <= 'Z') { *c = (char) (*c + 32); }   // sysfs paths are lowercase
+    }
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", bus);
+    FILE * f = fopen(path, "r");
+    if (f == NULL) {
+        return -1;
+    }
+    int node = -1;
+    if (fscanf(f, "%d", &node) != 1) {
+        node = -1;
+    }
+    fclose(f);
+    return node;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5430,6 +5505,21 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_copy_stream_d2d") == 0) {
         return (void *)ggml_backend_cuda_copy_stream_d2d;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_numa_node") == 0) {
+        return (void *)ggml_backend_cuda_get_numa_node;
+    }
+    if (strcmp(name, "ggml_backend_cuda_record_copy_slot") == 0) {
+        return (void *)ggml_backend_cuda_record_copy_slot;
+    }
+    if (strcmp(name, "ggml_backend_cuda_compute_wait_slot") == 0) {
+        return (void *)ggml_backend_cuda_compute_wait_slot;
+    }
+    if (strcmp(name, "ggml_backend_cuda_record_compute_slot") == 0) {
+        return (void *)ggml_backend_cuda_record_compute_slot;
+    }
+    if (strcmp(name, "ggml_backend_cuda_copies_wait_slot") == 0) {
+        return (void *)ggml_backend_cuda_copies_wait_slot;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

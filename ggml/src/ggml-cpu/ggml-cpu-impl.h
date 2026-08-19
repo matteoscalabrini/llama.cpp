@@ -543,6 +543,7 @@ bool         ggml_numa_mirror_enabled(void);
 bool         ggml_backend_cpu_buft_is_mirrorable(struct ggml_backend_buffer_type * buft);
 void         ggml_numa_mirror_register(struct ggml_backend_buffer * buffer, void * base, size_t size);
 const void * ggml_numa_mirror_remap(const void * p);
+const void * ggml_numa_mirror_remap_node(const void * p, int node);
 void         ggml_numa_mirror_scan_graph(const struct ggml_cgraph * cgraph);
 
 #ifdef __cplusplus

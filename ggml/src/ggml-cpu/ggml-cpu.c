@@ -1046,6 +1046,24 @@ const void * ggml_numa_mirror_remap(const void * p) {
     return p; // out-of-range: activations, KV, wdata - always the original pointer
 }
 
+// As above, but for an explicitly named node rather than the calling thread's. The
+// op-offload upload path needs this: the thread issuing the H2D copy has no relation to
+// the NUMA node the destination GPU hangs off, so "current node" is the wrong replica.
+const void * ggml_numa_mirror_remap_node(const void * p, int node) {
+    const int n = atomic_load_explicit(&g_numa_mirror.n_bufs, memory_order_acquire);
+    if (n == 0 || node < 0 || node >= GGML_NUMA_MAX_NODES) {
+        return p;
+    }
+    for (int i = 0; i < n; ++i) {
+        const uintptr_t off = (uintptr_t) p - (uintptr_t) g_numa_mirror.bufs[i].base;
+        if (off < g_numa_mirror.bufs[i].size) {
+            const void * rep = g_numa_mirror.bufs[i].replica[node];
+            return rep != NULL ? (const char *) rep + off : p;
+        }
+    }
+    return p;
+}
+
 // called single-threaded from the CPU backend's graph_compute, before the
 // parallel region: registers host weight buffers feeding CPU GEMMs
 void ggml_numa_mirror_scan_graph(const struct ggml_cgraph * cgraph) {
@@ -1137,6 +1155,11 @@ void ggml_numa_mirror_register(struct ggml_backend_buffer * buffer, void * base,
 }
 
 const void * ggml_numa_mirror_remap(const void * p) {
+    return p;
+}
+
+const void * ggml_numa_mirror_remap_node(const void * p, int node) {
+    GGML_UNUSED(node);
     return p;
 }
 
