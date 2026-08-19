@@ -223,3 +223,24 @@ So the combined prod recipe is `--membind=0` + pinning + `GGML_NUMA_MIRROR=1`, n
 - `ggml/src/ggml-cpu/ggml-cpu.cpp` — one call in `ggml_backend_cpu_graph_compute`
 - Harnesses in `/root/`: `numa_precheck2.sh` (locality premise), `numa_gate.sh` +
   `numa_verify.sh` (engagement + bit-exactness + truncated perf), `numa_full_ab.sh` (full model)
+
+## Prefill overlap — design B (parked, scoped 2026-08-19)
+
+Option A (shipped first) double-buffers the WHOLE expert tensor per layer: no kernel
+changes, costs one extra staging buffer. Option B cuts staging below one tensor and is
+the shape the multi-GPU slice needs, but it requires expert-subset semantics that
+MUL_MAT_ID does not have — its signature is (ctx, as, b, ids) and ids are absolute
+indices into the full staged tensor, with no offset and no skip-write path.
+
+**B concretely = the standard MoE gather/scatter reorganization:**
+1. sort the (slot, token) pairs by expert id
+2. each group g then owns a CONTIGUOUS range of that sorted order, so its experts are a
+   contiguous id range and can be staged into a buffer of size (expert_tensor / G)
+3. run one matmul per group over its sorted range, with ids rebased by -g*(E/G)
+4. scatter results back to the original (slot, token) positions
+
+Outputs stay disjoint (one row per (slot, token), the MoE weighted sum is a separate
+downstream op), so there is no accumulation reorder and the result should remain
+bit-exact. The work is the sort, the rebase, the per-group views, and the inverse
+permutation on the output - across the CUDA kernel and the graph builder. That is a
+deliberate kernel project, not an increment on A.
