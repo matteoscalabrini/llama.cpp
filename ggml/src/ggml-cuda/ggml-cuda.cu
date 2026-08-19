@@ -5334,6 +5334,56 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// ---- prefill overlap: dedicated H2D copy stream + ordering events ----------------
+// One copy stream and one event pair per device, created on first use. The events are
+// created with cudaEventDisableTiming: they exist only to order streams.
+struct ggml_cuda_copy_ctx {
+    cudaStream_t stream      = nullptr;
+    cudaEvent_t  copy_done   = nullptr;
+    cudaEvent_t  compute_done = nullptr;
+};
+
+static ggml_cuda_copy_ctx & ggml_cuda_copy_ctx_get(int device) {
+    static ggml_cuda_copy_ctx ctxs[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_copy_ctx & c = ctxs[device];
+    if (c.stream == nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&c.stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&c.copy_done,    cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&c.compute_done, cudaEventDisableTiming));
+    }
+    return c;
+}
+
+// issue a host->device weight upload on the copy stream instead of the compute stream
+extern "C" void ggml_backend_cuda_set_tensor_async_copy_stream(
+        ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_copy_ctx & c = ggml_cuda_copy_ctx_get(cuda_ctx->device);
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, c.stream));
+}
+
+// compute-after-copy: everything already queued on the copy stream must land before the
+// compute stream proceeds
+extern "C" void ggml_backend_cuda_compute_wait_for_copies(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_copy_ctx & c = ggml_cuda_copy_ctx_get(cuda_ctx->device);
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaEventRecord(c.copy_done, c.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), c.copy_done, 0));
+}
+
+// copy-after-compute: the copy stream must not overwrite a staging buffer whose consumer
+// is still running on the compute stream
+extern "C" void ggml_backend_cuda_copies_wait_for_compute(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_copy_ctx & c = ggml_cuda_copy_ctx_get(cuda_ctx->device);
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaEventRecord(c.compute_done, cuda_ctx->stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(c.stream, c.compute_done, 0));
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5344,6 +5394,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_tensor_async_copy_stream") == 0) {
+        return (void *)ggml_backend_cuda_set_tensor_async_copy_stream;
+    }
+    if (strcmp(name, "ggml_backend_cuda_compute_wait_for_copies") == 0) {
+        return (void *)ggml_backend_cuda_compute_wait_for_copies;
+    }
+    if (strcmp(name, "ggml_backend_cuda_copies_wait_for_compute") == 0) {
+        return (void *)ggml_backend_cuda_copies_wait_for_compute;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
