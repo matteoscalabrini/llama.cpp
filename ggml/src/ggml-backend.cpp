@@ -1610,6 +1610,22 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// op-offload profiling (GGML_SCHED_OFFLOAD_PROFILE=1). Splits a graph into the terms
+// that matter for expert-slice planning: weight upload and expert compute both divide
+// by the number of GPUs a slice is spread over; everything else (attention, dense
+// layers, norms, reductions) is fixed and sets the achievable ceiling.
+static bool ggml_sched_offload_profile(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_SCHED_OFFLOAD_PROFILE"); v = (e && e[0] && strcmp(e, "0")) ? 1 : 0; }
+    return v == 1;
+}
+static int64_t g_off_copy_us     = 0;
+static int64_t g_off_exp_comp_us = 0;
+static int64_t g_off_oth_comp_us = 0;
+static size_t  g_off_bytes       = 0;
+static int     g_off_splits      = 0;
+static int     g_off_exp_splits  = 0;
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1622,6 +1638,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const bool    off_prof          = ggml_sched_offload_profile();
+        const int64_t off_t_split_start = off_prof ? ggml_time_us() : 0;
+        const size_t  off_bytes_before  = g_off_bytes;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1704,6 +1723,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        if (ggml_sched_offload_profile()) {
+                            g_off_bytes += expert_size_copy + padding_end;
+                        }
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
@@ -1751,6 +1773,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        int64_t off_t_copy_done = off_t_split_start;
+        if (off_prof && g_off_bytes > off_bytes_before) {
+            ggml_backend_synchronize(split_backend);
+            off_t_copy_done = ggml_time_us();
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1790,12 +1818,51 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (off_prof) {
+            ggml_backend_synchronize(split_backend);
+            const int64_t t_end = ggml_time_us();
+            g_off_splits++;
+            if (g_off_bytes > off_bytes_before) {
+                g_off_copy_us     += off_t_copy_done - off_t_split_start;
+                g_off_exp_comp_us += t_end - off_t_copy_done;
+                g_off_exp_splits++;
+            } else {
+                g_off_oth_comp_us += t_end - off_t_split_start;
+            }
+        }
+
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+    }
+
+    if (ggml_sched_offload_profile() && g_off_bytes > 0) {
+        const double up = g_off_copy_us / 1e6, ec_ = g_off_exp_comp_us / 1e6, oc = g_off_oth_comp_us / 1e6;
+        const double gb = g_off_bytes / 1e9;
+        fprintf(stderr,
+            "offload-profile: %d splits (%d w/ upload) | upload %.3f s (%.1f GB, %.1f GB/s) | "
+            "expert-compute %.3f s | other-compute %.3f s (FIXED) | total %.3f s\n",
+            g_off_splits, g_off_exp_splits, up, gb, up > 0 ? gb / up : 0.0, ec_, oc, up + ec_ + oc);
+        // An N-way expert slice divides upload and expert compute; the rest is fixed.
+        // A prefetch occupies the copy engine while the SMs run, so transfer overlaps
+        // ALL compute: wall(N) = max(upload/N, expert_compute/N + fixed).
+        for (int n = 1; n <= 4; n++) {
+            const double xfer    = up / n;
+            const double compute = ec_ / n + oc;
+            const double ideal   = xfer > compute ? xfer : compute;
+            fprintf(stderr, "  N=%d: transfer %.3f s vs compute %.3f s (expert %.3f + fixed %.3f)"
+                            " -> wall %.3f s (%.2fx, %s-bound)\n",
+                    n, xfer, compute, ec_ / n, oc, ideal,
+                    (up + ec_ + oc) / (ideal + 1e-9), xfer > compute ? "transfer" : "compute");
+        }
+        fprintf(stderr, "  ceiling with infinite GPUs = fixed %.3f s (%.2fx)\n",
+                oc, (up + ec_ + oc) / (oc + 1e-9));
+        fflush(stderr);
+        g_off_copy_us = g_off_exp_comp_us = g_off_oth_comp_us = 0;
+        g_off_bytes = 0; g_off_splits = g_off_exp_splits = 0;
     }
 
     return GGML_STATUS_SUCCESS;
