@@ -244,3 +244,30 @@ downstream op), so there is no accumulation reorder and the result should remain
 bit-exact. The work is the sort, the rebase, the per-group views, and the inverse
 permutation on the output - across the CUDA kernel and the graph builder. That is a
 deliberate kernel project, not an increment on A.
+
+## Prefetch stage — constraints to honour when implementing (2026-08-19)
+
+1. **Alternate buffers by upload sequence, NOT split index.** Splits without an offload
+   upload must not advance the parity, or two consecutive UPLOADING splits land on the
+   same buffer, which is precisely the race the double buffer exists to prevent. Keep a
+   counter incremented only when a split actually uploads.
+2. **FRAC < 1.0 needs a consolidation step; the kernel cannot read across two buffers.**
+   MUL_MAT_ID indexes one contiguous tensor. The workable shape is: prefetch frac into
+   the shadow during compute(i); after compute(i), D2D shadow->primary plus H2D of the
+   remaining (1-frac) directly into primary. The D2D is ~5 ms for 3.28 GB at VRAM
+   bandwidth, i.e. free relative to a ~12 s upload. As of this commit nothing calls the
+   shadow buffer yet, so no such assumption exists in the code — it has to be built
+   correctly, not fixed.
+3. **The correctness gate must be the loaded case.** A 452-token trunc10 prefill cannot
+   expose a copy/compute race: too few splits, no saturation. Gate on a full 9.5k prefill,
+   greedy, logprobs compared across several repeated runs, where an intermittent race
+   shows up as run-to-run variation rather than a clean mismatch. trunc10 stays the
+   iteration loop; the full model is the gate.
+
+Engagement for every feature is now one file:
+
+    cat /tmp/ggml-numa-mirror.$(pgrep -x llama-server)
+      coverage_pct / mirrored_bytes ...         <- NUMA mirror
+      offload_overlap_requested / _engaged ...  <- op-offload overlap
+
+Use `pgrep -x`, not `-f`: `-f` matches the setsid wrapper and returns the wrong pid.

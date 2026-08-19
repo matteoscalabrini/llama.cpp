@@ -1109,7 +1109,7 @@ void ggml_numa_mirror_scan_graph(const struct ggml_cgraph * cgraph) {
             if (dir[0] != '\0' && strcmp(dir, "off") != 0) {
                 char path[512];
                 if (snprintf(path, sizeof(path), "%s/ggml-numa-mirror.%d", dir, (int) getpid()) < (int) sizeof(path)) {
-                    FILE * sf = fopen(path, "w");
+                    FILE * sf = fopen(path, "a"); // shared with the offload section
                     if (sf != NULL) {
                         fprintf(sf, "coverage_pct %.1f\nmirrored_bytes %zu\nnot_mirrored_bytes %zu\n"
                                     "gemm_weight_bytes_in_graph %zu\nnodes %d\nhome_node %d\nbuffers %d\n",

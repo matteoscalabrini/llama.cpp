@@ -18,6 +18,9 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <unistd.h> // getpid, for the per-process status file
+#endif
 #include <string.h>
 #include <algorithm>
 #include <vector>
@@ -1644,6 +1647,22 @@ static double ggml_sched_prefetch_frac(void) {
     return f;
 }
 
+// Engagement status, appended to the same per-PID file the NUMA mirror writes, so a
+// single cat answers "did every feature actually turn on" without per-feature greps or
+// knowing when each one initialises.
+static void ggml_sched_offload_status_write(bool engaged) {
+    const char * dir = getenv("GGML_NUMA_MIRROR_STATUS_DIR");
+    if (dir == NULL) { dir = "/tmp"; }
+    if (dir[0] == '\0' || strcmp(dir, "off") == 0) { return; }
+    char path[512];
+    if (snprintf(path, sizeof(path), "%s/ggml-numa-mirror.%d", dir, (int) getpid()) >= (int) sizeof(path)) { return; }
+    FILE * f = fopen(path, "a");
+    if (f == NULL) { return; }
+    fprintf(f, "offload_overlap_requested %d\noffload_overlap_engaged %d\noffload_prefetch_frac %.2f\n",
+            ggml_sched_offload_overlap() ? 1 : 0, engaged ? 1 : 0, ggml_sched_prefetch_frac());
+    fclose(f);
+}
+
 // CUDA-only entry points, resolved once through the registry (no interface change)
 typedef void (*ggml_sched_set_async_copy_t)(ggml_backend_t, struct ggml_tensor *, const void *, size_t, size_t);
 typedef void (*ggml_sched_stream_edge_t)(ggml_backend_t);
@@ -1674,6 +1693,7 @@ static ggml_sched_overlap_api & ggml_sched_overlap_api_get(ggml_backend_t backen
                     ggml_sched_prefetch_frac());
             fflush(stderr);
         }
+        ggml_sched_offload_status_write(api.ok);
     }
     return api;
 }
