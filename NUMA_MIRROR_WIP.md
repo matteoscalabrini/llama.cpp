@@ -271,3 +271,70 @@ Engagement for every feature is now one file:
       offload_overlap_requested / _engaged ...  <- op-offload overlap
 
 Use `pgrep -x`, not `-f`: `-f` matches the setsid wrapper and returns the wrong pid.
+
+
+## Prefetch stage — BUILT 2026-08-19 (commit 1c873f08b)
+
+Design A is implemented. After issuing compute for an uploading split the scheduler looks
+ahead to the next uploading split on the same device and streams its experts onto the copy
+stream, into a staging buffer the current split is not reading. The host barrier that used
+to sit in front of every upload is gone; ordering is now the event pair from 7a30e6fee.
+
+**What the earlier "copy stream is performance-neutral" result actually meant.** The
+serialiser was never the shared stream. With `GGML_SCHED_MAX_COPIES=1` `sched->events` is
+NULL, so "wait for the split backend to finish using the input before overwriting it"
+falls through to a host-side `ggml_backend_synchronize` — the host blocks until the GPU is
+idle, *then* issues the next copy. Moving copies to another stream cannot help while that
+barrier stands. e8651293a was plumbing; this commit is the change.
+
+**The trap that cost a build cycle: one extra buffer is not enough.** Alternating between
+the shadow and *the next split's own staging block* looks like it halves the VRAM cost.
+It silently corrupts. `ggml_gallocr` derives that block's free interval from where the copy
+sits in SPLIT order, and the splitter starts a new split per host weight precisely so the
+memory can be recycled for whatever runs in between (see `need_new_split`). Writing it
+early lands on live activations. Both halves of the double buffer must be invisible to the
+allocator: two shadows, alternating by upload sequence. Cost is 2 x one expert tensor
+(2 x 3.28 GB on the full model, 2 x 1.59 GiB on trunc10).
+
+Symptom worth recognising: NaNs from the first prefetched layer onward, which the server
+returns as a **well-formed response with `logprob: null` at every position** and `'?'`
+characters in the text. A harness that only parses `timings` sees a healthy 16% speedup.
+The float() cast on a null logprob is what caught it.
+
+**Constraint 1 from the list below was right and is implemented** (counter incremented only
+on splits that actually upload). **Constraint 2 was right about needing consolidation** and
+that path is implemented for FRAC < 1: stage a fraction in ONE shadow, then D2D into the
+primary plus an H2D tail at the consuming split — a write at the time the allocator
+expects it, hence safe with a single buffer. That is the VRAM-cheap alternative to two
+full shadows. **Constraint 3 was right that trunc10 cannot gate this**, and for a second
+reason beyond too-few splits: a 10-layer carve has a degenerate router, so its expert
+coverage is ~19% (3.8 GB selective vs 19.65 GB full) against the full model's ~95% at
+ub4096. trunc10 therefore over-states the cost of the unconditional copy by ~5x.
+
+**Measured on trunc10** (2402-token prompt, ub2048, CUDA_VISIBLE_DEVICES=3, mirror on),
+all three arms bit-exact against each other, 3 self-consistent runs each:
+
+| arm | bytes uploaded | pp |
+|---|---|---|
+| selective copy, no overlap | 3.8 GB | 2970 |
+| unconditional copy, no prefetch | 19.65 GB | 1190 |
+| unconditional copy + prefetch | 19.65 GB | **1383 (+16.2%)** |
+
+The middle row is the attribution control: it isolates the byte cost of the unconditional
+copy (which prefetch forces, since layer N+1's ids do not exist while layer N runs) from
+the pipeline itself. On this instrument the arm is overwhelmingly transfer-bound, so +16%
+is near its own ceiling — not a prediction for the full model.
+
+**Knobs.** `GGML_SCHED_OFFLOAD_OVERLAP=1` turns it on. `GGML_SCHED_OFFLOAD_PREFETCH=0`
+keeps the copy stream without the lookahead (the e8651293a behaviour, for attribution).
+`GGML_SCHED_OFFLOAD_PREFETCH_FRAC<1` selects the consolidation path. Prefetch **stands
+down under `GGML_SCHED_OFFLOAD_PROFILE=1`**, whose per-upload syncs serialise the engines
+by design — never A/B the two together, it measures the serial case. Engagement:
+`cat /tmp/ggml-numa-mirror.$(pgrep -x llama-server)` -> `offload_prefetch_engaged`.
+
+**Full-model gating note.** Run the gate with MTP OFF. With `--spec-type draft-mtp` two
+identical greedy requests return different text — draft acceptance changes the verify
+batch shape run to run — so the baseline arm is not self-consistent and the race detector
+has nothing to stand on. Speculative decoding does not touch the prefill path.
+Prod's `--fit on` leaves only the default 1024 MiB margin, which will not hold two
+shadows: gate with `--fit-target 8192,1024,1024,1024` (GPU0 is the offload target).
