@@ -1625,6 +1625,94 @@ static int64_t g_off_oth_comp_us = 0;
 static size_t  g_off_bytes       = 0;
 static int     g_off_splits      = 0;
 static int     g_off_exp_splits  = 0;
+static bool    g_off_bytes_uploaded_this_split = false;
+
+// ---- prefill overlap (design A) --------------------------------------------------
+static bool ggml_sched_offload_overlap(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_SCHED_OFFLOAD_OVERLAP"); v = (e && e[0] && strcmp(e, "0")) ? 1 : 0; }
+    return v == 1;
+}
+static double ggml_sched_prefetch_frac(void) {
+    static double f = -1.0;
+    if (f < 0.0) {
+        const char * e = getenv("GGML_SCHED_OFFLOAD_PREFETCH_FRAC");
+        f = e ? atof(e) : 1.0;
+        if (f < 0.0) f = 0.0;
+        if (f > 1.0) f = 1.0;
+    }
+    return f;
+}
+
+// CUDA-only entry points, resolved once through the registry (no interface change)
+typedef void (*ggml_sched_set_async_copy_t)(ggml_backend_t, struct ggml_tensor *, const void *, size_t, size_t);
+typedef void (*ggml_sched_stream_edge_t)(ggml_backend_t);
+struct ggml_sched_overlap_api {
+    ggml_sched_set_async_copy_t set_async_copy  = nullptr;
+    ggml_sched_stream_edge_t    compute_after_copy = nullptr;
+    ggml_sched_stream_edge_t    copy_after_compute = nullptr;
+    bool resolved = false;
+    bool ok       = false;
+};
+static ggml_sched_overlap_api & ggml_sched_overlap_api_get(ggml_backend_t backend) {
+    static ggml_sched_overlap_api api;
+    if (!api.resolved) {
+        api.resolved = true;
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (reg != NULL) {
+            api.set_async_copy = (ggml_sched_set_async_copy_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_tensor_async_copy_stream");
+            api.compute_after_copy = (ggml_sched_stream_edge_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_compute_wait_for_copies");
+            api.copy_after_compute = (ggml_sched_stream_edge_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_copies_wait_for_compute");
+        }
+        api.ok = api.set_async_copy && api.compute_after_copy && api.copy_after_compute;
+        if (ggml_sched_offload_overlap()) {
+            fprintf(stderr, "offload-overlap: %s (prefetch fraction %.2f)\n",
+                    api.ok ? "enabled" : "DISABLED - backend does not export a copy stream",
+                    ggml_sched_prefetch_frac());
+            fflush(stderr);
+        }
+    }
+    return api;
+}
+
+// one shadow staging buffer per device, grown on demand
+struct ggml_sched_shadow {
+    ggml_backend_buffer_t buf = nullptr;
+    size_t size = 0;
+    void * base = nullptr;
+};
+static void * ggml_sched_shadow_get(ggml_backend_t backend, size_t size) {
+    static ggml_sched_shadow shadows[GGML_SCHED_MAX_BACKENDS];
+    static int n_shadow = 0;
+    static ggml_backend_t owners[GGML_SCHED_MAX_BACKENDS] = { nullptr };
+    int idx = -1;
+    for (int i = 0; i < n_shadow; i++) { if (owners[i] == backend) { idx = i; break; } }
+    if (idx < 0) {
+        if (n_shadow >= GGML_SCHED_MAX_BACKENDS) return nullptr;
+        idx = n_shadow++;
+        owners[idx] = backend;
+    }
+    ggml_sched_shadow & sh = shadows[idx];
+    if (sh.size >= size) return sh.base;
+    if (sh.buf) { ggml_backend_buffer_free(sh.buf); sh.buf = nullptr; sh.base = nullptr; sh.size = 0; }
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    sh.buf = ggml_backend_buft_alloc_buffer(buft, size);
+    if (sh.buf == nullptr) {
+        fprintf(stderr, "offload-overlap: could not allocate %.2f GiB shadow staging buffer - "
+                        "overlap disabled for this backend (lower GGML_SCHED_OFFLOAD_PREFETCH_FRAC "
+                        "or leave more VRAM headroom via --fit-target)\n", size / (1024.0*1024.0*1024.0));
+        fflush(stderr);
+        return nullptr;
+    }
+    sh.size = size;
+    sh.base = ggml_backend_buffer_get_base(sh.buf);
+    fprintf(stderr, "offload-overlap: shadow staging buffer %.2f GiB\n", size / (1024.0*1024.0*1024.0));
+    fflush(stderr);
+    return sh.base;
+}
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
@@ -1639,6 +1727,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         const bool    off_prof          = ggml_sched_offload_profile();
+        g_off_bytes_uploaded_this_split = false;
         const int64_t off_t_split_start = off_prof ? ggml_time_us() : 0;
         const size_t  off_bytes_before  = g_off_bytes;
 
@@ -1726,12 +1815,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (ggml_sched_offload_profile()) {
                             g_off_bytes += expert_size_copy + padding_end;
                         }
-                        ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                        {
+                            g_off_bytes_uploaded_this_split = true;
+                            ggml_sched_overlap_api & ovl = ggml_sched_overlap_api_get(split_backend);
+                            if (ggml_sched_offload_overlap() && ovl.ok) {
+                                ovl.set_async_copy(split_backend, input_cpy,
+                                    (const uint8_t *)input->data + expert_offset, expert_offset,
+                                    expert_size_copy + padding_end);
+                            } else {
+                                ggml_backend_tensor_set_async(split_backend,
+                                    input_cpy,
+                                    (const uint8_t *)input->data + expert_offset, expert_offset,
+                                    // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                                    // this is necessary for MMQ in the CUDA backend
+                                    expert_size_copy + padding_end);
+                            }
+                        }
                     };
 
                     int id = 0;
@@ -1770,6 +1869,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
+            }
+        }
+
+        if (ggml_sched_offload_overlap() && g_off_bytes_uploaded_this_split) {
+            ggml_sched_overlap_api & ovl = ggml_sched_overlap_api_get(split_backend);
+            if (ovl.ok) {
+                ovl.compute_after_copy(split_backend);
             }
         }
 
