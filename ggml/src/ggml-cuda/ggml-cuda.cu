@@ -5384,6 +5384,27 @@ extern "C" void ggml_backend_cuda_copies_wait_for_compute(ggml_backend_t backend
     CUDA_CHECK(cudaStreamWaitEvent(c.stream, c.compute_done, 0));
 }
 
+// raw host->device upload on the copy stream. Prefetch needs a raw destination because
+// the bytes land in a shadow staging buffer, not in the tensor's own storage.
+extern "C" void ggml_backend_cuda_copy_stream_h2d(
+        ggml_backend_t backend, void * dst, const void * src, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_copy_ctx & c = ggml_cuda_copy_ctx_get(cuda_ctx->device);
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, c.stream));
+}
+
+// device->device consolidation on the copy stream (shadow -> the split's own staging
+// buffer). Used when only a fraction of the tensor is prefetched and the kernel still
+// has to read one contiguous tensor.
+extern "C" void ggml_backend_cuda_copy_stream_d2d(
+        ggml_backend_t backend, void * dst, const void * src, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_copy_ctx & c = ggml_cuda_copy_ctx_get(cuda_ctx->device);
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, c.stream));
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5403,6 +5424,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_copies_wait_for_compute") == 0) {
         return (void *)ggml_backend_cuda_copies_wait_for_compute;
+    }
+    if (strcmp(name, "ggml_backend_cuda_copy_stream_h2d") == 0) {
+        return (void *)ggml_backend_cuda_copy_stream_h2d;
+    }
+    if (strcmp(name, "ggml_backend_cuda_copy_stream_d2d") == 0) {
+        return (void *)ggml_backend_cuda_copy_stream_d2d;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

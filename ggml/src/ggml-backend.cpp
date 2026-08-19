@@ -1647,6 +1647,17 @@ static double ggml_sched_prefetch_frac(void) {
     return f;
 }
 
+// Prefetch is what actually puts bytes on the wire while the SMs work; the copy stream
+// alone only moves the copies sideways. Kept separable so the two can be A/B'd apart.
+// Default ON whenever overlap is on.
+static bool ggml_sched_offload_prefetch(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_SCHED_OFFLOAD_PREFETCH"); v = (e && e[0] && strcmp(e, "0") == 0) ? 0 : 1; }
+    return v == 1;
+}
+static size_t g_off_prefetch_bytes  = 0;
+static int    g_off_prefetch_splits = 0;
+
 // Engagement status, appended to the same per-PID file the NUMA mirror writes, so a
 // single cat answers "did every feature actually turn on" without per-feature greps or
 // knowing when each one initialises.
@@ -1663,13 +1674,31 @@ static void ggml_sched_offload_status_write(bool engaged) {
     fclose(f);
 }
 
+// Written once, the first time a graph actually prefetches, so `cat` on the status file
+// answers "did the overlap do anything" without needing a log line at the right moment.
+static void ggml_sched_prefetch_status_write(int splits, size_t bytes, double frac) {
+    const char * dir = getenv("GGML_NUMA_MIRROR_STATUS_DIR");
+    if (dir == NULL) { dir = "/tmp"; }
+    if (dir[0] == '\0' || strcmp(dir, "off") == 0) { return; }
+    char path[512];
+    if (snprintf(path, sizeof(path), "%s/ggml-numa-mirror.%d", dir, (int) getpid()) >= (int) sizeof(path)) { return; }
+    FILE * f = fopen(path, "a");
+    if (f == NULL) { return; }
+    fprintf(f, "offload_prefetch_engaged 1\noffload_prefetch_splits %d\noffload_prefetch_gb %.2f\noffload_prefetch_frac_used %.2f\n",
+            splits, bytes / 1e9, frac);
+    fclose(f);
+}
+
 // CUDA-only entry points, resolved once through the registry (no interface change)
 typedef void (*ggml_sched_set_async_copy_t)(ggml_backend_t, struct ggml_tensor *, const void *, size_t, size_t);
 typedef void (*ggml_sched_stream_edge_t)(ggml_backend_t);
+typedef void (*ggml_sched_copy_raw_t)(ggml_backend_t, void *, const void *, size_t);
 struct ggml_sched_overlap_api {
     ggml_sched_set_async_copy_t set_async_copy  = nullptr;
     ggml_sched_stream_edge_t    compute_after_copy = nullptr;
     ggml_sched_stream_edge_t    copy_after_compute = nullptr;
+    ggml_sched_copy_raw_t       copy_h2d = nullptr;
+    ggml_sched_copy_raw_t       copy_d2d = nullptr;
     bool resolved = false;
     bool ok       = false;
 };
@@ -1685,8 +1714,13 @@ static ggml_sched_overlap_api & ggml_sched_overlap_api_get(ggml_backend_t backen
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_compute_wait_for_copies");
             api.copy_after_compute = (ggml_sched_stream_edge_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_copies_wait_for_compute");
+            api.copy_h2d = (ggml_sched_copy_raw_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_copy_stream_h2d");
+            api.copy_d2d = (ggml_sched_copy_raw_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_copy_stream_d2d");
         }
-        api.ok = api.set_async_copy && api.compute_after_copy && api.copy_after_compute;
+        api.ok = api.set_async_copy && api.compute_after_copy && api.copy_after_compute &&
+                 api.copy_h2d && api.copy_d2d;
         if (ggml_sched_offload_overlap()) {
             fprintf(stderr, "offload-overlap: %s (prefetch fraction %.2f)\n",
                     api.ok ? "enabled" : "DISABLED - backend does not export a copy stream",
@@ -1704,10 +1738,11 @@ struct ggml_sched_shadow {
     size_t size = 0;
     void * base = nullptr;
 };
-static void * ggml_sched_shadow_get(ggml_backend_t backend, size_t size) {
-    static ggml_sched_shadow shadows[GGML_SCHED_MAX_BACKENDS];
+static void * ggml_sched_shadow_get(ggml_backend_t backend, size_t size, int slot) {
+    static ggml_sched_shadow shadows[GGML_SCHED_MAX_BACKENDS][2];
     static int n_shadow = 0;
     static ggml_backend_t owners[GGML_SCHED_MAX_BACKENDS] = { nullptr };
+    GGML_ASSERT(slot == 0 || slot == 1);
     int idx = -1;
     for (int i = 0; i < n_shadow; i++) { if (owners[i] == backend) { idx = i; break; } }
     if (idx < 0) {
@@ -1715,7 +1750,7 @@ static void * ggml_sched_shadow_get(ggml_backend_t backend, size_t size) {
         idx = n_shadow++;
         owners[idx] = backend;
     }
-    ggml_sched_shadow & sh = shadows[idx];
+    ggml_sched_shadow & sh = shadows[idx][slot];
     if (sh.size >= size) return sh.base;
     if (sh.buf) { ggml_backend_buffer_free(sh.buf); sh.buf = nullptr; sh.base = nullptr; sh.size = 0; }
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
@@ -1729,7 +1764,7 @@ static void * ggml_sched_shadow_get(ggml_backend_t backend, size_t size) {
     }
     sh.size = size;
     sh.base = ggml_backend_buffer_get_base(sh.buf);
-    fprintf(stderr, "offload-overlap: shadow staging buffer %.2f GiB\n", size / (1024.0*1024.0*1024.0));
+    fprintf(stderr, "offload-overlap: shadow staging buffer %d: %.2f GiB\n", slot, size / (1024.0*1024.0*1024.0));
     fflush(stderr);
     return sh.base;
 }
@@ -1742,6 +1777,110 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // ---- prefill overlap (design A) -------------------------------------------------
+    // The splitter starts a NEW split for every host-resident weight precisely so the
+    // staging VRAM of the previous one can be reused, and with GGML_SCHED_MAX_COPIES=1
+    // that reuse is guarded by a host-side ggml_backend_synchronize before each upload.
+    // That barrier - not the shared stream - is what made copy and compute alternate.
+    // Prefetch replaces it with a second staging buffer plus stream-ordered events: while
+    // split i computes, the next uploading split's experts stream into the buffer split i
+    // is not reading.
+    //
+    // The profiler syncs the device after every upload to attribute time, which is exactly
+    // what prefetch removes; running both would measure the serialised case under a name
+    // that says otherwise. Prefetch stands down so a PROFILE run keeps its old meaning.
+    if (ggml_sched_offload_overlap() && ggml_sched_offload_prefetch() && ggml_sched_offload_profile()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "offload-overlap: prefetch stands down while GGML_SCHED_OFFLOAD_PROFILE=1 "
+                            "(the profiler serialises copy and compute by design)\n");
+            fflush(stderr);
+        }
+    }
+    const bool   ovl_enabled = ggml_sched_offload_overlap() && ggml_sched_offload_prefetch() &&
+                               !ggml_sched_offload_profile();
+    const double ovl_frac    = ggml_sched_prefetch_frac();
+
+    // index of the input this split uploads MoE expert weights for, or -1. Mirrors the
+    // condition the selective-expert copy below tests.
+    auto ovl_upload_input = [&](struct ggml_backend_sched_split * s) -> int {
+        if (s->graph.n_nodes == 0) {
+            return -1;
+        }
+        struct ggml_tensor * node = s->graph.nodes[0];
+        if (node->op != GGML_OP_MUL_MAT_ID) {
+            return -1;
+        }
+        for (int i = 0; i < s->n_inputs; i++) {
+            struct ggml_tensor * input = s->inputs[i];
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) || input->buffer == NULL) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                !ggml_backend_buffer_is_host(input->buffer)) {
+                continue;
+            }
+            if (node->src[0] == tensor_copy(input, s->backend_id, sched->cur_copy)) {
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    int    ovl_seq          = 0;        // counts ONLY splits that actually upload
+    int    ovl_prefetched   = -1;       // split id whose upload has already been issued
+    void * ovl_prefetch_dst = nullptr;  // where those bytes landed
+    void * ovl_shadow[2]    = { nullptr, nullptr };
+    size_t ovl_shadow_size  = 0;
+    int    ovl_backend_id   = -1;
+    bool   ovl_ready        = false;
+
+    if (ovl_enabled) {
+        // Size the shadow once, from the largest expert tensor in the graph, so it is
+        // never reallocated while a copy is in flight.
+        size_t max_bytes = 0;
+        int    first_up  = -1;
+        for (int i = 0; i < sched->n_splits; i++) {
+            const int in = ovl_upload_input(&splits[i]);
+            if (in < 0) {
+                continue;
+            }
+            if (first_up < 0) {
+                first_up = i;
+            }
+            const size_t nb = ggml_nbytes(splits[i].inputs[in]);
+            if (nb > max_bytes) {
+                max_bytes = nb;
+            }
+        }
+        if (first_up >= 0) {
+            // Pipeline within one device only: the ordering events are per device, so a
+            // prefetch onto another GPU would be sequenced against the wrong stream.
+            ovl_backend_id = splits[first_up].backend_id;
+            ggml_backend_t tgt = sched->backends[ovl_backend_id];
+            ggml_sched_overlap_api & ovl = ggml_sched_overlap_api_get(tgt);
+            if (ovl.ok) {
+                // Both halves of the double buffer must be invisible to ggml_gallocr. Its
+                // free interval for a staging block begins where the copy sits in SPLIT
+                // order, and the splitter recycles that memory for whatever runs between
+                // two uploaders - so prefetching into a later split's own block overwrites
+                // activations the allocator still considers live.
+                ovl_shadow_size = ovl_frac >= 1.0 ? max_bytes : (size_t) (max_bytes * ovl_frac);
+                if (ovl_shadow_size > 0) {
+                    ovl_shadow[0] = ggml_sched_shadow_get(tgt, ovl_shadow_size, 0);
+                    if (ovl_frac >= 1.0 && ovl_shadow[0] != nullptr) {
+                        // frac < 1 consolidates into the primary at the consuming split,
+                        // which is a write at the time the allocator expects it, so one
+                        // buffer is enough there.
+                        ovl_shadow[1] = ggml_sched_shadow_get(tgt, ovl_shadow_size, 1);
+                    }
+                }
+                ovl_ready = ovl_shadow[0] != nullptr && (ovl_frac < 1.0 || ovl_shadow[1] != nullptr);
+            }
+        }
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1750,6 +1889,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         g_off_bytes_uploaded_this_split = false;
         const int64_t off_t_split_start = off_prof ? ggml_time_us() : 0;
         const size_t  off_bytes_before  = g_off_bytes;
+
+        const int  ovl_in   = (ovl_ready && split_backend_id == ovl_backend_id)
+                            ? ovl_upload_input(split) : -1;
+        const bool ovl_done = ovl_in >= 0 && split_id == ovl_prefetched;
+        struct ggml_tensor * ovl_restore_tensor = nullptr;
+        void *               ovl_restore_data   = nullptr;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1766,6 +1911,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
+                if (ovl_done && input_id == ovl_in) {
+                    // Already uploaded on the copy stream during an earlier split. The
+                    // buffer it landed in is protected by the stream events, so the host
+                    // barrier is skipped here - that barrier is what serialised the engines.
+                    ggml_sched_overlap_api & ovl = ggml_sched_overlap_api_get(split_backend);
+                    if (ovl_frac >= 1.0) {
+                        // whole tensor prefetched: point the kernel at where it landed
+                        if (ovl_prefetch_dst != input_cpy->data) {
+                            ovl_restore_tensor = input_cpy;
+                            ovl_restore_data   = input_cpy->data;
+                            input_cpy->data    = ovl_prefetch_dst;
+                        }
+                    } else {
+                        // MUL_MAT_ID reads ONE contiguous tensor, so a partial prefetch has
+                        // to be consolidated: D2D the prefetched head out of the shadow and
+                        // H2D the tail, both ordered after the previous consumer of this
+                        // staging buffer has finished.
+                        const size_t nb   = ggml_nbytes(input);
+                        const size_t head = std::min(ovl_shadow_size, nb);
+                        ovl.copy_after_compute(split_backend);
+                        ovl.copy_d2d(split_backend, input_cpy->data, ovl_prefetch_dst, head);
+                        if (nb > head) {
+                            ovl.copy_h2d(split_backend, (char *) input_cpy->data + head,
+                                         (const char *) input->data + head, nb - head);
+                        }
+                        if (ggml_sched_offload_profile()) {
+                            g_off_bytes += nb - head;
+                        }
+                    }
+                    g_off_bytes_uploaded_this_split = true;
+                    continue;
+                }
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -1892,7 +2069,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (ggml_sched_offload_overlap() && g_off_bytes_uploaded_this_split) {
+        if (ggml_sched_offload_overlap() && (g_off_bytes_uploaded_this_split || ovl_done)) {
             ggml_sched_overlap_api & ovl = ggml_sched_overlap_api_get(split_backend);
             if (ovl.ok) {
                 ovl.compute_after_copy(split_backend);
@@ -1903,6 +2080,47 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (off_prof && g_off_bytes > off_bytes_before) {
             ggml_backend_synchronize(split_backend);
             off_t_copy_done = ggml_time_us();
+        }
+
+        // Hand the next uploading split's experts to the copy engine so they land while
+        // THIS split computes. Two things make it safe:
+        //  - copy_after_compute is recorded before this split's compute is enqueued, so the
+        //    copies wait only for the previous consumer of the buffer they overwrite, not
+        //    for the compute they are meant to hide behind;
+        //  - destinations alternate by UPLOAD SEQUENCE, not split index. Only a minority of
+        //    splits upload, so parity on split_id would put two consecutive uploaders in the
+        //    same buffer - the exact race the second buffer exists to prevent.
+        if (ovl_ready && ovl_in >= 0) {
+            int next = -1;
+            for (int k = split_id + 1; k < sched->n_splits; k++) {
+                if (splits[k].backend_id == ovl_backend_id && ovl_upload_input(&splits[k]) >= 0) {
+                    next = k;
+                    break;
+                }
+            }
+            if (next >= 0) {
+                const int            nin_id = ovl_upload_input(&splits[next]);
+                struct ggml_tensor * nin    = splits[next].inputs[nin_id];
+                struct ggml_tensor * ncpy   = tensor_copy(nin, splits[next].backend_id, sched->cur_copy);
+                const size_t nb    = ggml_nbytes(nin);
+                const int    nseq  = ovl_seq + 1;
+                void *       dst   = ovl_frac >= 1.0 ? ovl_shadow[nseq % 2] : ovl_shadow[0];
+                const size_t bytes = std::min(ovl_shadow_size, nb);
+                GGML_UNUSED(ncpy);
+                if (dst != nullptr && bytes > 0) {
+                    ggml_sched_overlap_api & ovl = ggml_sched_overlap_api_get(split_backend);
+                    ovl.copy_after_compute(split_backend);
+                    ovl.copy_h2d(split_backend, dst, nin->data, bytes);
+                    ovl_prefetched   = next;
+                    ovl_prefetch_dst = dst;
+                    g_off_prefetch_splits++;
+                    g_off_prefetch_bytes += bytes;
+                    if (ggml_sched_offload_profile()) {
+                        g_off_bytes += bytes;
+                    }
+                }
+            }
+            ovl_seq++;
         }
 
         if (!sched->callback_eval) {
@@ -1944,6 +2162,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (ovl_restore_tensor != nullptr) {
+            // the kernels above were launched with the shadow address; put the allocator's
+            // own pointer back so nothing downstream ever sees a mutated tensor
+            ovl_restore_tensor->data = ovl_restore_data;
+            ovl_restore_tensor = nullptr;
+        }
+
         if (off_prof) {
             ggml_backend_synchronize(split_backend);
             const int64_t t_end = ggml_time_us();
@@ -1962,6 +2187,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
+        }
+    }
+
+    if (ovl_ready && g_off_prefetch_splits > 0) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            fprintf(stderr, "offload-overlap: prefetch engaged - %d uploads, %.2f GB on the copy stream "
+                            "(frac %.2f, %d x %.2f GiB shadow)\n",
+                    g_off_prefetch_splits, g_off_prefetch_bytes / 1e9, ovl_frac,
+                    ovl_frac >= 1.0 ? 2 : 1, ovl_shadow_size / (1024.0*1024.0*1024.0));
+            fflush(stderr);
+            ggml_sched_prefetch_status_write(g_off_prefetch_splits, g_off_prefetch_bytes, ovl_frac);
         }
     }
 
