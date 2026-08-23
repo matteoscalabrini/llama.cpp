@@ -232,6 +232,10 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     // initialize CPU backend now to avoid slowing the first graph computation
     ggml_cpu_init();
 
+    // hand the scheduler our NUMA-mirror remap function (see ggml-backend-impl.h);
+    // both init paths (direct and device registry) funnel through here
+    ggml_sched_set_remap_node_fn(ggml_numa_mirror_remap_node);
+
     struct ggml_backend_cpu_context * ctx = new ggml_backend_cpu_context;
     if (ctx == NULL) {
         return NULL;

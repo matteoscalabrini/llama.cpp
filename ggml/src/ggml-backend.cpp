@@ -1787,21 +1787,19 @@ static ggml_sched_overlap_api & ggml_sched_overlap_api_get(ggml_backend_t backen
 // ---- item #5: read uploads from the replica local to the destination GPU -----------
 // The mirror keeps a replica per node but ggml_numa_mirror_remap() picks the replica for
 // the CALLING THREAD's node, which has nothing to do with where the destination card sits.
-typedef const void * (*ggml_sched_remap_node_t)(const void *, int);
 typedef int          (*ggml_sched_numa_node_t)(ggml_backend_t);
 
+// The CPU backend registers its remap function here at init (dependency inversion).
+// The previous registry lookup (ggml_backend_reg_by_name from inside ggml-base) was
+// an upward dependency that stopped linking when upstream moved the registry symbols.
+static ggml_sched_remap_node_t g_sched_remap_node_fn = nullptr;
+
+void ggml_sched_set_remap_node_fn(ggml_sched_remap_node_t fn) {
+    g_sched_remap_node_fn = fn;
+}
+
 static ggml_sched_remap_node_t ggml_sched_remap_node_fn(void) {
-    static ggml_sched_remap_node_t fn = nullptr;
-    static bool resolved = false;
-    if (!resolved) {
-        resolved = true;
-        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
-        if (reg != NULL) {
-            fn = (ggml_sched_remap_node_t)
-                ggml_backend_reg_get_proc_address(reg, "ggml_numa_mirror_remap_node");
-        }
-    }
-    return fn;
+    return g_sched_remap_node_fn;
 }
 
 static int ggml_sched_backend_numa_node(ggml_backend_t backend) {
