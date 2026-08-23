@@ -2657,6 +2657,38 @@ static const int8_t keven_signs_q2xs[1024] = {
 };
 #endif
 
+#if defined(__AVX2__)
+// Build, without touching keven_signs_q2xs, the 32 sign bytes that
+//     keven_signs_q2xs[(aux >> 7*k) & 127],  k = 0..3
+// would deliver, in "mask" form: 0x00 where the quant is kept, 0xff where it is negated.
+//
+// keven_signs_q2xs[j] (j < 128) is: byte b < 7 negative iff bit b of j is set, byte 7 negative
+// iff popcount(j) is odd. This is ik_llama.cpp's EvenSignHelper idea; ik's vectorised form
+// (iqk_gemm_iquants.cpp, EvenSignHelper::sign_2_values) needs _mm256_popcnt_epi32, i.e.
+// AVX512-VPOPCNTDQ, which Zen 2 does not have. Here the parity is obtained instead from a
+// 16-entry pshufb LUT using parity(v) == parity((v ^ (v >> 4)) & 0xf), which is plain AVX2.
+static inline __m256i iq3xxs_sign_mask_avx2(uint32_t aux) {
+    // 7-bit field k lands in bits 0..6 of the 32-bit lanes 2k and 2k+1, everything else zeroed
+    const __m256i lshift = _mm256_set_epi32(4, 4, 11, 11, 18, 18, 25, 25);
+    // replicate byte 0 of every 32-bit lane over that lane => all 8 bytes of quad-word k hold field k
+    const __m256i bcast  = _mm256_set_epi64x(0x0c0c0c0c08080808LL, 0x0404040400000000LL,
+                                             0x0c0c0c0c08080808LL, 0x0404040400000000LL);
+    const __m256i m0f    = _mm256_set1_epi8(0x0f);
+    // parity of the low nibble, as 0x80 (odd) / 0x00 (even) -- i.e. directly the missing 8th sign bit
+    const __m256i par    = _mm256_set_epi64x(0x0080800080000080LL, (long long)0x8000008000808000ULL,
+                                             0x0080800080000080LL, (long long)0x8000008000808000ULL);
+    // byte b of every quad-word selects bit b
+    const __m256i bitsel = _mm256_set1_epi64x((long long)0x8040201008040201ULL);
+
+    __m256i v = _mm256_srli_epi32(_mm256_sllv_epi32(_mm256_set1_epi32(aux), lshift), 25);
+    v = _mm256_shuffle_epi8(v, bcast);
+    const __m256i p = _mm256_shuffle_epi8(par,
+            _mm256_and_si256(_mm256_xor_si256(v, _mm256_srli_epi16(v, 4)), m0f));
+    const __m256i idx = _mm256_or_si256(v, p);
+    return _mm256_cmpeq_epi8(_mm256_and_si256(idx, bitsel), bitsel);
+}
+#endif
+
 void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -3272,8 +3304,6 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
 #if defined(__AVX2__)
 
-    const uint64_t * signs64 = (const uint64_t *)keven_signs_q2xs;
-
     uint32_t aux32[2];
 
     __m256 accumf = _mm256_setzero_ps();
@@ -3294,12 +3324,12 @@ void ggml_vec_dot_iq3_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
                                                   iq3xxs_grid[q3[3]], iq3xxs_grid[q3[2]], iq3xxs_grid[q3[1]], iq3xxs_grid[q3[0]]);
             q3 += 8;
             memcpy(aux32, gas, 8); gas += 8;
-            const __m256i s2_1 = _mm256_set_epi64x(signs64[(aux32[0] >> 21) & 127], signs64[(aux32[0] >> 14) & 127],
-                                                   signs64[(aux32[0] >>  7) & 127], signs64[(aux32[0] >>  0) & 127]);
-            const __m256i s2_2 = _mm256_set_epi64x(signs64[(aux32[1] >> 21) & 127], signs64[(aux32[1] >> 14) & 127],
-                                                   signs64[(aux32[1] >>  7) & 127], signs64[(aux32[1] >>  0) & 127]);
-            const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
-            const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
+            // Signs are computed in-register instead of being looked up in keven_signs_q2xs:
+            // this drops 8 scalar table loads per 64 quants, and the kernel is load-port bound.
+            const __m256i m2_1 = iq3xxs_sign_mask_avx2(aux32[0]);
+            const __m256i m2_2 = iq3xxs_sign_mask_avx2(aux32[1]);
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(q8_1, m2_1), m2_1);
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(q8_2, m2_2), m2_2);
             const __m256i dot1  = _mm256_maddubs_epi16(q2_1, q8s_1);
             const __m256i dot2  = _mm256_maddubs_epi16(q2_2, q8s_2);
             const uint16_t ls1 = aux32[0] >> 28;
@@ -4016,14 +4046,39 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
 #if defined __AVX2__
 
+    // 256-bit copy of the value LUT, so that the nibble -> value expansion runs one
+    // _mm256_shuffle_epi8 per 32 quants instead of two _mm_shuffle_epi8 plus a lane insert.
+    // (ik_llama.cpp: DequantizerIQ4XS / Q4Bits::dequant16, iqk_gemm_kquants.cpp)
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
-    const __m128i m4b  = _mm_set1_epi8(0x0f);
+    const __m256i values256 = MM256_SET_M128I(values128, values128);
+    const __m256i m4b  = _mm256_set1_epi8(0x0f);
+
+    // ik_llama.cpp ScaleIQ4XS: all 8 block scales of a super-block, already -32 biased,
+    // in one __m128i of int16 -- replaces 8 scalar extractions plus 8 GPR->vector broadcasts.
+    const __m128i hshift   = _mm_set_epi32(12, 8, 4, 0);
+    const __m128i lshift   = _mm_set_epi32(4, 0, 4, 0);
+    const __m128i hmask    = _mm_set1_epi16(0x03);
+    const __m128i lmask    = _mm_set1_epi8(0xf);
+    const __m128i lshuffle = _mm_set_epi32(0x07030602, 0x05010400, 0x07030602, 0x05010400);
+    const __m128i m32      = _mm_set1_epi16(-32);
+    // pshufb pattern that broadcasts int16 lane 0; +2 per byte walks it to the next lane
+    const __m256i sc_step  = _mm256_set1_epi8(2);
 
     __m256 accum = _mm256_setzero_ps();
     for (int ibl = 0; ibl < nb; ++ibl) {
         const uint8_t * qs = x[ibl].qs;
         const int8_t  * q8 = y[ibl].qs;
-        uint16_t sh = x[ibl].scales_h;
+
+        uint32_t scales_l32;
+        static_assert(sizeof(x[ibl].scales_l) == sizeof(scales_l32), "iq4_xs scales_l must fill a uint32 exactly");
+        memcpy(&scales_l32, x[ibl].scales_l, sizeof(scales_l32));
+        const uint32_t tmp32 = (uint32_t)x[ibl].scales_h | ((uint32_t)x[ibl].scales_h << 14);
+        const __m128i sh = _mm_slli_epi16(_mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32(tmp32), hshift), hmask), 4);
+        const __m128i sl = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32(scales_l32), lshift), lmask);
+        const __m128i scales128 = _mm_add_epi16(_mm_or_si128(sh, _mm_cvtepi8_epi16(_mm_shuffle_epi8(sl, lshuffle))), m32);
+        const __m256i all_scales = MM256_SET_M128I(scales128, scales128);
+
+        __m256i sc_shuf = _mm256_set1_epi16(0x0100);
         __m256i sumi1 = _mm256_setzero_si256();
         __m256i sumi2 = _mm256_setzero_si256();
         for (int ib = 0; ib < QK_K/32; ib += 2) {
@@ -4031,17 +4086,18 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
             const __m128i q4bits_2 = _mm_loadu_si128((const __m128i*)qs);  qs += 16;
             const __m256i q8b_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
             const __m256i q8b_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
-            const __m256i q4b_1 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b)),
-                                                  _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
-            const __m256i q4b_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
-                                                  _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
+            const __m256i q4b_1 = _mm256_shuffle_epi8(values256,
+                    _mm256_and_si256(MM256_SET_M128I(_mm_srli_epi16(q4bits_1, 4), q4bits_1), m4b));
+            const __m256i q4b_2 = _mm256_shuffle_epi8(values256,
+                    _mm256_and_si256(MM256_SET_M128I(_mm_srli_epi16(q4bits_2, 4), q4bits_2), m4b));
             const __m256i p16_1 = mul_add_epi8(q4b_1, q8b_1);
             const __m256i p16_2 = mul_add_epi8(q4b_2, q8b_2);
-            const int16_t ls1 = ((x[ibl].scales_l[ib/2] & 0xf) | ((sh << 4) & 0x30)) - 32;
-            const int16_t ls2 = ((x[ibl].scales_l[ib/2] >>  4) | ((sh << 2) & 0x30)) - 32;
-            sh >>= 4;
-            const __m256i p_1 = _mm256_madd_epi16(p16_1, _mm256_set1_epi16(ls1));
-            const __m256i p_2 = _mm256_madd_epi16(p16_2, _mm256_set1_epi16(ls2));
+            const __m256i ls1 = _mm256_shuffle_epi8(all_scales, sc_shuf);
+            sc_shuf = _mm256_add_epi8(sc_shuf, sc_step);
+            const __m256i ls2 = _mm256_shuffle_epi8(all_scales, sc_shuf);
+            sc_shuf = _mm256_add_epi8(sc_shuf, sc_step);
+            const __m256i p_1 = _mm256_madd_epi16(p16_1, ls1);
+            const __m256i p_2 = _mm256_madd_epi16(p16_2, ls2);
             sumi1 = _mm256_add_epi32(p_1, sumi1);
             sumi2 = _mm256_add_epi32(p_2, sumi2);
         }
