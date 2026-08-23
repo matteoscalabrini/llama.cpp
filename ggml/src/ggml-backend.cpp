@@ -1883,6 +1883,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    int prev_backend_id = -1;
+
     // ---- prefill overlap (design A) -------------------------------------------------
     // The splitter starts a NEW split for every host-resident weight precisely so the
     // staging VRAM of the previous one can be reused, and with GGML_SCHED_MAX_COPIES=1
@@ -2015,6 +2017,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         struct ggml_tensor * ovl_restore_tensor = nullptr;
         void *               ovl_restore_data   = nullptr;
+
+        // ensure the previous split's async work has completed before we start
+        // this split, the allocator may have reused buffer regions across splits
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(sched->backends[prev_backend_id]);
+            }
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -2336,12 +2348,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // record the event of this copy
-        if (split->n_inputs > 0) {
-            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
-            }
+        // record the event of this split
+        // (upstream race fix: unconditional, so no-input splits on a different
+        // backend can synchronize against it -- see the prev_backend_id wait above)
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
+
+        prev_backend_id = split_backend_id;
     }
 
     if (tl && g_tl_uploads > 0) {
