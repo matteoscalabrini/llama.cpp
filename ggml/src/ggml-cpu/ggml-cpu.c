@@ -729,7 +729,7 @@ bool ggml_is_numa(void) {
 }
 
 //
-// NUMA weight mirroring (env GGML_NUMA_MIRROR=1)
+// NUMA weight mirroring (--numa mirror; env GGML_NUMA_MIRROR=1 = back-compat override)
 //
 // Keeps a full per-NUMA-node replica of large host weight buffers so that the
 // CPU GEMM paths (mul_mat / mul_mat_id) read weights from node-local memory
@@ -885,8 +885,14 @@ static double ggml_numa_mirror_local_fraction(void * addr, size_t size, int node
 
 bool ggml_numa_mirror_enabled(void) {
     if (g_numa_mirror.enabled < 0) {
+        // primary switch: --numa mirror. ggml_numa_init() runs at backend init,
+        // before any weight buffer registers here, so the strategy is settled by
+        // the time this gate is first evaluated. GGML_NUMA_MIRROR=1 is kept as a
+        // back-compat override for configs that predate the flag.
+        const bool via_flag = g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR;
         const char * env = getenv("GGML_NUMA_MIRROR");
-        bool on = env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+        const bool via_env = env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+        bool on = via_flag || via_env;
         if (on) {
             g_numa_mirror.n_nodes = ggml_numa_mirror_count_nodes();
             if (g_numa_mirror.n_nodes < 2) {
@@ -899,7 +905,8 @@ bool ggml_numa_mirror_enabled(void) {
         g_numa_mirror.home_node = 0;
         g_numa_mirror.enabled = on ? 1 : 0;
         if (on) {
-            GGML_NUMA_MIRROR_LOG("enabled, %d nodes, home node %d, min buffer %zu MiB\n",
+            GGML_NUMA_MIRROR_LOG("enabled via %s, %d nodes, home node %d, min buffer %zu MiB\n",
+                    via_flag ? "--numa mirror" : "GGML_NUMA_MIRROR env",
                     g_numa_mirror.n_nodes, g_numa_mirror.home_node, g_numa_mirror.min_bytes >> 20);
         }
     }
@@ -2607,6 +2614,9 @@ static void set_numa_thread_affinity(int thread_n) {
 
     switch(g_state.numa.numa_strategy) {
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
+        case GGML_NUMA_STRATEGY_MIRROR:
+            // mirror implies distribute for thread placement: the per-node weight
+            // replicas are what make the distributed threads' reads node-local
             // run thread on node_num thread_n / (threads per node)
             node_num = thread_n % g_state.numa.n_nodes;
             break;

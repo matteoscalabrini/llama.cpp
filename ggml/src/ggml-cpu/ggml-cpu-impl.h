@@ -534,7 +534,8 @@ void ggml_barrier(struct ggml_threadpool * tp);
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
 int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
 
-// NUMA weight mirroring (env GGML_NUMA_MIRROR=1, GGML_NUMA_MIRROR_MIN_MB=N)
+// NUMA weight mirroring (--numa mirror; env GGML_NUMA_MIRROR=1 kept as a
+// back-compat override, GGML_NUMA_MIRROR_MIN_MB=N tunes the size floor)
 // Off by default: ggml_numa_mirror_remap is an immediate return when no buffer
 // is registered, so the vanilla path pays one relaxed atomic load per GEMM op.
 bool         ggml_numa_mirror_enabled(void);
